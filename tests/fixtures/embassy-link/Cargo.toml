@@ -1,0 +1,18 @@
+[package]
+name = "pocket-embassy-link-check"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+pocket-embassy = { path = "../../../platforms/embassy" }
+pocket-runtime = { path = "../../../engine/runtime" }
+pocket-drivers = { path = "../../../engine/drivers" }
+embassy-time = { version = "0.5", features = ["tick-hz-1_000_000", "generic-queue-8"] }
+embassy-time-driver = { version = "0.2", features = ["tick-hz-1_000_000"] }
+critical-section = "1.2"
+
+[profile.release]
+panic = "abort"

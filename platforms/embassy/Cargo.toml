@@ -1,0 +1,19 @@
+[package]
+name = "pocket-embassy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Embassy host and bare-metal QuickJS guest for PocketJS"
+
+[dependencies]
+pocket-runtime.workspace = true
+pocket-drivers.workspace = true
+pocket-render.workspace = true
+pocket-raster.workspace = true
+embassy-time = "0.5"
+
+[build-dependencies]
+cc = "1.2"

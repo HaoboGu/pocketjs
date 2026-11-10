@@ -3,6 +3,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "platforms/embassy",
     "platforms/gba/video",
     "platforms/posix/svc-wire",
     "platforms/rockbox/input",

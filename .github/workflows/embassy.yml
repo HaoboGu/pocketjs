@@ -1,0 +1,40 @@
+name: Embassy host
+on:
+  workflow_dispatch: {}
+  pull_request:
+    paths:
+      - 'platforms/embassy/**'
+      - 'engine/guest-quickjs/**'
+      - 'engine/runtime/**'
+      - 'engine/drivers/**'
+      - 'engine/raster/**'
+      - 'tests/fixtures/embassy-*/**'
+      - '.github/workflows/embassy.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+permissions:
+  contents: read
+jobs:
+  host-and-arm:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install ARM C libraries and Rust target
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+          rustup target add thumbv7em-none-eabihf
+      - name: Fetch pinned QuickJS-NG
+        run: |
+          git init "$RUNNER_TEMP/quickjs"
+          git -C "$RUNNER_TEMP/quickjs" fetch --depth 1 https://github.com/quickjs-ng/quickjs d8e1cc68f71fba2e084a18408ab2e6f9838b4d20
+          git -C "$RUNNER_TEMP/quickjs" checkout --detach FETCH_HEAD
+          echo "POCKET_QUICKJS_DIR=$RUNNER_TEMP/quickjs" >> "$GITHUB_ENV"
+      - name: Test and lint the host
+        run: |
+          cargo test --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked
+          cargo clippy --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked --all-targets -- -D warnings
+          cargo run --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked
+      - name: Link the bare-metal ARM fixture
+        run: python3 tests/fixtures/embassy-link/build.py thumbv7em-none-eabihf --cc arm-none-eabi-gcc
