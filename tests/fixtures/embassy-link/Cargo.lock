@@ -175,11 +175,8 @@ dependencies = [
 name = "pocket-embassy"
 version = "0.16.0"
 dependencies = [
- "cc",
  "embassy-time",
  "pocket-drivers",
- "pocket-raster",
- "pocket-render",
  "pocket-runtime",
 ]
 
@@ -187,11 +184,23 @@ dependencies = [
 name = "pocket-embassy-link-check"
 version = "0.0.0"
 dependencies = [
+ "cc",
  "critical-section",
  "embassy-time",
  "embassy-time-driver",
  "pocket-drivers",
  "pocket-embassy",
+ "pocket-guest-quickjs",
+ "pocket-package",
+ "pocket-raster",
+ "pocket-runtime",
+]
+
+[[package]]
+name = "pocket-guest-quickjs"
+version = "0.16.0"
+dependencies = [
+ "pocket-drivers",
  "pocket-runtime",
 ]
 

@@ -8,9 +8,10 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
     task::{Context, Waker},
 };
-use pocket_drivers::{DamageRect, InputFrameBuilder, InputSource};
-use pocket_embassy::{Display, QuickJs, Ui};
-use pocket_runtime::{Cow, InputClasses, Profile, RuntimeConfig};
+#[path = "../../embassy-host/src/fixture.rs"]
+mod program;
+use pocket_embassy::display::{Frame, Transport};
+use pocket_runtime::Runtime;
 
 // Link-only fixture: this arena and inert clock are not a board support package.
 struct Bump;
@@ -49,53 +50,28 @@ unsafe impl critical_section::Impl for Critical {
     unsafe fn release(_: critical_section::RawRestoreState) {}
 }
 struct Screen;
-impl Display for Screen {
+impl Transport for Screen {
     type Error = ();
-    async fn present(&mut self, pixels: &[u16], _: u32, _: &[DamageRect]) -> Result<(), ()> {
-        core::hint::black_box(pixels);
+    async fn write(&mut self, frame: Frame<'_>) -> Result<(), ()> {
+        core::hint::black_box(frame.pixels);
         Ok(())
     }
 }
-struct Input;
-impl InputSource for Input {
-    fn classes(&self) -> InputClasses {
-        InputClasses::NONE
-    }
-    fn poll(&mut self, _: &mut InputFrameBuilder) {}
-}
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
-    let config = RuntimeConfig {
-        profile_hash: [0x5a; 32],
-        host_abi: pocket_drivers::spec::BINDING_GENERATION,
-        heap_limit: 256 * 1024,
-        frame_buffer_budget: 16 * 16 * 2,
-        profile: Profile {
-            id: Cow::Borrowed("link-test"),
-            cadences: Cow::Borrowed(&[60]),
-            viewport: [16, 16],
-            logical_viewports: Cow::Borrowed(&[[16, 16]]),
-            dynamic_viewport: None,
-            presentations: Cow::Borrowed(&[Cow::Borrowed("native")]),
-            auxiliary: None,
-            auxiliary_logical: Cow::Borrowed(&[]),
-            density: 1,
-            animation: Cow::Borrowed("composited"),
-            capabilities: Cow::Borrowed(&[]),
-            required_inputs: InputClasses::NONE,
-        },
-    };
-    let guest = QuickJs::new(
-        config,
-        64 * 1024,
-        b"globalThis.frame=()=>{}",
-        Cow::Borrowed(&[]),
-    )
-    .unwrap();
-    let mut ui = Ui::new(guest).unwrap();
-    let mut input = Input;
-    let mut display = Screen;
-    let mut future = core::pin::pin!(ui.run(&mut input, &mut display));
+    let (runtime, mut presenter) =
+        program::program(program::SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
+    runtime.with_runtime(Runtime::boot).unwrap();
+    let timing = runtime
+        .with_runtime(|runtime| Ok(runtime.timing().unwrap()))
+        .unwrap();
+    let mut ticker = pocket_embassy::runner::Ticker::new(timing, 100_000).unwrap();
+    {
+        let mut next = core::pin::pin!(ticker.next());
+        let _ = core::hint::black_box(next.as_mut().poll(&mut Context::from_waker(Waker::noop())));
+    }
+    let mut screen = Screen;
+    let mut future = core::pin::pin!(presenter.present(&mut screen));
     let _ = core::hint::black_box(
         future
             .as_mut()

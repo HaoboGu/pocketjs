@@ -6,14 +6,13 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish = false
-description = "Embassy host and bare-metal QuickJS guest for PocketJS"
+description = "Embassy pacing and asynchronous transport for PocketJS display outputs"
+
+[features]
+default = ["runner"]
+runner = ["dep:pocket-runtime", "dep:embassy-time"]
 
 [dependencies]
-pocket-runtime.workspace = true
+pocket-runtime = { workspace = true, optional = true }
 pocket-drivers.workspace = true
-pocket-render.workspace = true
-pocket-raster.workspace = true
-embassy-time = "0.5"
-
-[build-dependencies]
-cc = "1.2"
+embassy-time = { version = "0.5", optional = true }

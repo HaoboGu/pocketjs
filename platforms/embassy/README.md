@@ -1,70 +1,100 @@
-# pocket-embassy
+# Embassy adapters
 
-Run a PocketJS JavaScript guest and RGB565 software renderer from an Embassy task.
-The crate uses `no_std` and `alloc`. The application owns the allocator, executor,
-stack, clock driver, and display peripherals. No ESP HAL or RMK types enter the API.
+**The program owns the Runtime, guest, package, renderer and peripherals.** This
+crate provides a CPU `DisplayOutput` adapter and Embassy deadline waits. It does
+not load JavaScript, select an engine, draw a UI tree or compile C code.
 
-## Build
+The boundary matches the other platforms: ESP-IDF's runner drives the canonical
+runtime, Zephyr registers display/input drivers, and the program selects its guest
+and memory policy. `pocket-embassy` uses `no_std` and `alloc`; the program installs
+the allocator and Embassy time driver.
 
-Provide the QuickJS-NG **0.16.2** sources through `POCKET_QUICKJS_DIR`. The build
-uses `cc` and its target-specific `CC`, `AR`, and `CFLAGS` configuration. It compiles
-the engine and the existing PocketJS guest binding; it does not fetch dependencies.
-For bare metal, a build-directory copy excludes unused pthread helpers; the
-source checkout stays unchanged. Private clock functions use Embassy time.
-Bare-metal builds require the target C runtime and math library. The board owns
-those link settings and any newlib syscall hooks. They are not selected by chip name.
+## Components
+
+| Component | Responsibility |
+| --- | --- |
+| `display::BufferedDisplay` | Register a CPU-visible output with the existing presentation coordinator |
+| `display::Presenter` | Submit its completed buffer to an asynchronous transport |
+| `display::Transport` | Board-owned DMA, wire format and peripheral access |
+| `runner::Ticker` | Wait for deadlines from the runtime's selected `Timing` |
+
+The default `runner` feature adds `pocket-runtime` and `embassy-time`. A display-only
+consumer uses `default-features = false`; the display adapter depends on
+`pocket-drivers` and has no UI-core, rasterizer or executor dependency.
+
+## Compose an application
+
+Create the runtime from the program's exported host contract. Register a package
+source, a guest and input sources through the existing Runtime API. Register
+`pocket_raster::RasterRenderer` as the software renderer, then add the output:
+
+```rust
+let (output, mut presenter) = BufferedDisplay::new(
+    DisplayRole::Primary, width, height, PixelFormat::Rgb565, framebuffer_budget,
+)?;
+runtime.add_display(output, RendererId::SOFTWARE)?;
+runtime.boot()?;
+presenter.present(&mut panel).await?;
+let mut ticker = Ticker::new(runtime.timing().unwrap(), max_lag_us)?;
+loop {
+    ticker.next().await?;
+    runtime.tick()?;
+    presenter.present(&mut panel).await?;
+}
+```
+
+The program imports `BufferedDisplay` from `pocket_embassy::display` and `Ticker`
+from `pocket_embassy::runner`. A C guest uses `pocket_runtime::abi::Handle` and
+`with_runtime` for these runtime calls. The complete executable composition is in
+[`tests/fixtures/embassy-host`](../../tests/fixtures/embassy-host).
+
+**Package admission and cadence selection remain in Runtime.** Pass its `Timing`
+to `Ticker`; an admitted 30 Hz application can select 30 Hz from a host that also
+advertises 60 Hz. `Ticker` uses `TickSchedule`'s lag policy and returns one due tick.
+The program retains control of cancellation, retries, shutdown and extra work.
+Drop or join its transfer future before shutting down the runtime and peripherals.
+
+## Display ownership
+
+`BufferedDisplay` supports RGB565, RGBA8888 and ARGB8888 full-frame CPU storage.
+The constructor checks the supplied byte budget. The normal coordinator performs
+layout-independent damage tracking, software rendering and resource retirement.
+Pixel format, dimensions and scale follow the registered output and package.
+
+The coordinator's `flush`/`wait` publishes the completed CPU buffer; it starts no
+peripheral I/O. `Presenter` moves that allocation into the async transfer and
+returns it after completion. **No full-frame copy occurs between those stages.**
+The transport receives the descriptor, native pixel bytes and physical damage
+rectangles. It owns any byte-order conversion, alignment and DMA staging.
+
+Drain each presenter after boot/present/tick and before the next runtime turn.
+An undrained or in-flight output rejects acquisition. A transport must stop
+borrowing bytes when its future returns or is dropped. Cancellation and errors
+return the buffer and change its generation, so a later `Runtime::present` repaints
+it without another guest turn. `Presenter::invalidate` handles panel resets.
+
+The output and presenter stay on one task. They create no task, thread or second
+core. JS evaluation and CPU rendering remain synchronous; async waits apply to
+pacing and peripheral I/O. The crate does not impose a frame-time guarantee.
+
+## Guest and build ownership
+
+Use any implementation of `pocket_runtime::Guest`. The optional
+[`pocket-guest-quickjs`](../../engine/guest-quickjs) Rust adapter owns the canonical
+C guest's realm. The program links its engine, runtime C exports and libc hooks.
+QuickJS toolchain details and source preparation are outside this platform crate.
+
+See the fixture commands below for a host build with that guest:
 
 ```sh
-export POCKET_QUICKJS_DIR=/absolute/path/to/quickjs
+export POCKET_QUICKJS_DIR=/absolute/path/to/quickjs-ng-0.16.2
 cargo test --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked
 cargo run --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked
 ```
 
-For the link-only check, install the Rust target and its C toolchain, then run:
-
-```sh
-python3 tests/fixtures/embassy-link/build.py thumbv7em-none-eabihf --cc arm-none-eabi-gcc
-python3 tests/fixtures/embassy-link/build.py riscv32imafc-unknown-none-elf --cc /path/to/riscv32-esp-elf-gcc
-```
-
-The executable example runs the real JS guest and an async display on the same
-Embassy executor as a heartbeat. `tests/fixtures/embassy-link` is a link-only
-bare-metal harness; it is not board firmware.
-
-## Application ownership
-
-Create `QuickJs` with `RuntimeConfig`, a JS stack budget, JavaScript bytes and an
-owned or static PAK. This embedded API takes a trusted, compiler-produced JS/PAK
-pair with matching binding generation. It does not admit arbitrary `.pocket`
-packages. The PAK stays alive until guest shutdown. `with_setup` attaches native
-extensions before the guest mounts its bindings; raw pointers belong to that realm.
-
-Pass the guest to `Ui::new`, provide an existing `InputSource`, and implement
-`Display::present`. Call `ui.run(&mut input, &mut display).await` in the application's
-task. The display receives RGB565 pixels, stride in pixels, and damage regions.
-It must stop borrowing the pixels when the future returns or is cancelled.
-A failed or cancelled submission forces a full repaint on the next frame.
-
-The first backend supports one surface at density 1. Viewport, heap, framebuffer
-budget and cadence come from `RuntimeConfig`; the JS stack limit is an argument.
-The application initializes its global allocator before creating the guest.
-No external RAM or second core is required by the API.
-
-The runner samples standard PocketJS input at the selected cadence. `frame` is
-available for an application-owned event loop. `wait_until` converts a selected
-microsecond deadline into an Embassy wait. `TickSchedule` skips obsolete wall-clock
-slots without replaying guest turns. Native-only animation skipping and
-application-specific state protocols are outside this host.
-
-JS evaluation and CPU rendering are synchronous. Interrupt-poll budgets abort
-runaway JS; they do not provide preemption or a wall-clock latency guarantee.
-The guest stays on its owner task. On bare metal, JS time reads use Embassy uptime,
-not a wall-clock date. Ordinary clocks and C syscalls outside QuickJS are unchanged.
-
-## Validation
-
-The host fixture checks JS exceptions, interrupt budgets, immutable package bytes,
-framebuffer limits, input transfer and cancellation recovery. Its executable checks
-that the UI runner and another Embassy task both make progress.
-The link fixture checks target C/Rust ABI and libc integration. Real display,
-DMA, allocator sizing and interrupt priorities remain board responsibilities.
+The tests execute canonical package admission, input sampling and rendering. They
+check pixel changes, display token/region contracts, transfer cancellation/failure,
+and interpreter errors. The executable checks 30 Hz cadence selection and progress
+of another Embassy task during display waits. The separate
+[`embassy-link`](../../tests/fixtures/embassy-link) fixture verifies ARM/RISC-V
+linking; its inert clock and arena do not establish board support or DMA timing.

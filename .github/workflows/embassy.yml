@@ -5,6 +5,7 @@ on:
     paths:
       - 'platforms/embassy/**'
       - 'engine/guest-quickjs/**'
+      - 'tools/packaging/quickjs/**'
       - 'engine/runtime/**'
       - 'engine/drivers/**'
       - 'engine/raster/**'
@@ -25,6 +26,10 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
           rustup target add thumbv7em-none-eabihf
+      - name: Check platform boundaries without a C engine
+        run: |
+          cargo test -p pocket-embassy --no-default-features --locked
+          cargo clippy -p pocket-embassy -p pocket-guest-quickjs --all-targets --locked --no-deps -- -D warnings
       - name: Fetch pinned QuickJS-NG
         run: |
           git init "$RUNNER_TEMP/quickjs"
@@ -37,4 +42,6 @@ jobs:
           cargo clippy --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked --all-targets -- -D warnings
           cargo run --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked
       - name: Link the bare-metal ARM fixture
-        run: python3 tests/fixtures/embassy-link/build.py thumbv7em-none-eabihf --cc arm-none-eabi-gcc
+        run: |
+          python3 tools/packaging/quickjs/prepare-baremetal.py --source "$POCKET_QUICKJS_DIR" --output "$RUNNER_TEMP/quickjs-baremetal"
+          POCKET_QUICKJS_DIR="$RUNNER_TEMP/quickjs-baremetal" python3 tests/fixtures/embassy-link/build.py thumbv7em-none-eabihf --cc arm-none-eabi-gcc

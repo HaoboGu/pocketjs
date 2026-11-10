@@ -2051,11 +2051,8 @@ dependencies = [
 name = "pocket-embassy"
 version = "0.16.0"
 dependencies = [
- "cc",
  "embassy-time",
  "pocket-drivers",
- "pocket-raster",
- "pocket-render",
  "pocket-runtime",
 ]
 
@@ -2091,6 +2088,14 @@ name = "pocket-glyph-pages"
 version = "0.16.0"
 dependencies = [
  "pocket-render",
+]
+
+[[package]]
+name = "pocket-guest-quickjs"
+version = "0.16.0"
+dependencies = [
+ "pocket-drivers",
+ "pocket-runtime",
 ]
 
 [[package]]

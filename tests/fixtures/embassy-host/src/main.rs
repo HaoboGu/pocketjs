@@ -1,25 +1,25 @@
 use embassy_executor::{Executor, Spawner};
-use embassy_time::{Duration, Timer};
-use pocket_drivers::{DamageRect, InputClasses, InputFrameBuilder, InputSource};
-use pocket_embassy::{Display, QuickJs, Ui};
-use pocket_runtime::Cow;
+use embassy_time::Timer;
+use pocket_embassy::{
+    display::{Frame, Transport},
+    runner::Ticker,
+};
+use pocket_runtime::Runtime;
 use static_cell::StaticCell;
 use std::sync::atomic::{AtomicU32, Ordering};
 static HEARTBEATS: AtomicU32 = AtomicU32::new(0);
-struct Screen;
-impl Display for Screen {
+struct Screen {
+    frames: usize,
+}
+impl Transport for Screen {
     type Error = ();
-    async fn present(&mut self, _: &[u16], _: u32, _: &[DamageRect]) -> Result<(), ()> {
-        Timer::after(Duration::from_millis(2)).await;
+    async fn write(&mut self, frame: Frame<'_>) -> Result<(), ()> {
+        assert_eq!(frame.descriptor.width, 24);
+        assert_eq!(frame.pixels.len(), 24 * 16 * 2);
+        Timer::after_millis(2).await;
+        self.frames += 1;
         Ok(())
     }
-}
-struct Input;
-impl InputSource for Input {
-    fn classes(&self) -> InputClasses {
-        InputClasses::NONE
-    }
-    fn poll(&mut self, _: &mut InputFrameBuilder) {}
 }
 #[embassy_executor::task]
 async fn heartbeat() {
@@ -30,35 +30,32 @@ async fn heartbeat() {
 }
 #[embassy_executor::task]
 async fn application() {
-    let guest = QuickJs::new(
-        pocket_embassy_host_check::config([32, 32]),
-        128 * 1024,
-        b"globalThis.frames=0;globalThis.frame=()=>{frames++}",
-        Cow::Borrowed(&[]),
-    )
-    .unwrap();
-    let mut ui = Ui::new(guest).unwrap();
-    let mut display = Screen;
-    let mut input = Input;
-    {
-        let result = ui.run(&mut input, &mut display);
-        // The runner and the timeout are polled on one executor thread.
-        let mut result = std::pin::pin!(result);
-        let mut timeout = std::pin::pin!(Timer::after_millis(250));
-        std::future::poll_fn(|cx| {
-            if let std::task::Poll::Ready(error) = result.as_mut().poll(cx) {
-                panic!("runner stopped: {error:?}");
-            }
-            timeout.as_mut().poll(cx)
-        })
-        .await;
-    }
-    ui.guest()
-        .evaluate(b"if(frames<5)throw Error('runner did not advance')")
+    let (runtime, mut presenter) = pocket_embassy_host_check::fixture::program(
+        pocket_embassy_host_check::fixture::SCRIPT,
+        pocket_drivers::spec::BINDING_GENERATION,
+    );
+    runtime.with_runtime(Runtime::boot).unwrap();
+    let timing = runtime
+        .with_runtime(|runtime| Ok(runtime.timing().unwrap()))
         .unwrap();
+    assert_eq!(timing.cadence_hz, 30);
+    let mut ticker = Ticker::new(timing, 100_000).unwrap();
+    let mut screen = Screen { frames: 0 };
+    presenter.present(&mut screen).await.unwrap();
+    for _ in 0..8 {
+        ticker.next().await.unwrap();
+        runtime.with_runtime(Runtime::tick).unwrap();
+        presenter.present(&mut screen).await.unwrap();
+    }
+    let context = runtime.op_context();
+    assert_eq!(context.core().unwrap().ui.node_text(3), Some("5:8"));
+    runtime.with_runtime(Runtime::shutdown).unwrap();
     let beats = HEARTBEATS.load(Ordering::Relaxed);
-    assert!(beats > 20, "heartbeat stalled: {beats}");
-    println!("PASS: Embassy UI runner with async display; heartbeat={beats}");
+    assert!(beats > 20 && screen.frames >= 2);
+    println!(
+        "PASS: canonical boot/tick/shutdown, selected cadence=30, display frames={}, heartbeat={beats}",
+        screen.frames
+    );
     std::process::exit(0);
 }
 fn main() {

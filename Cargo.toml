@@ -42,6 +42,7 @@ members = [
     "engine/widget",
     "engine/drivers",
     "engine/driver-kit",
+    "engine/guest-quickjs",
     "engine/guest-rquickjs",
     "platforms/apple",
     "engine/modules/media",
@@ -151,6 +152,7 @@ license = "MIT"
 repository = "https://github.com/pocket-nexus/pocketjs"
 
 [workspace.dependencies]
+pocket-guest-quickjs = { path = "engine/guest-quickjs", version = "0.16.0", default-features = false }
 pocket-vita-system = { path = "platforms/vita/system", version = "0.16.0", default-features = false }
 pocket-vita-io = { path = "platforms/vita/io", version = "0.16.0", default-features = false }
 pocket-vita-net = { path = "platforms/vita/net", version = "0.16.0", default-features = false }

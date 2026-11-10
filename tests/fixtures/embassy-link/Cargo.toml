@@ -7,6 +7,9 @@ publish = false
 [workspace]
 
 [dependencies]
+pocket-guest-quickjs = { path = "../../../engine/guest-quickjs" }
+pocket-package = { path = "../../../engine/package" }
+pocket-raster = { path = "../../../engine/raster" }
 pocket-embassy = { path = "../../../platforms/embassy" }
 pocket-runtime = { path = "../../../engine/runtime" }
 pocket-drivers = { path = "../../../engine/drivers" }
@@ -16,3 +19,6 @@ critical-section = "1.2"
 
 [profile.release]
 panic = "abort"
+
+[build-dependencies]
+cc = "1.2"
