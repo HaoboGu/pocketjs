@@ -1,4 +1,16 @@
 //! A QuickJS realm whose UI calls dispatch through the runtime's generated contract.
+#![cfg_attr(not(feature = "std"), no_std)]
+extern crate alloc;
+#[cfg(all(test, not(feature = "std")))]
+extern crate std;
+
+use alloc::{
+    borrow::ToOwned,
+    format,
+    string::{String, ToString},
+    vec,
+    vec::Vec,
+};
 use pocket_drivers::{
     abi::{
         POCKET_TEXT_COMMIT, POCKET_TEXT_COMPOSITION, POCKET_TEXT_COMPOSITION_END,
@@ -110,6 +122,11 @@ impl RquickjsGuest {
     pub fn with<R>(&self, f: impl for<'js> FnOnce(Ctx<'js>) -> R) -> Option<R> {
         self.context.as_ref().map(|ctx| ctx.with(f))
     }
+    /// Configure the initialized engine outside Context::with, for example its
+    /// stack limit or interrupt handler. The guest retains runtime ownership.
+    pub fn with_runtime<R>(&self, f: impl FnOnce(&Runtime) -> R) -> Option<R> {
+        self.runtime.as_ref().map(f)
+    }
     /// After a turn, whether it returned or threw: [`keep_collection_below_limit`].
     fn keep_below_limit(&mut self) {
         if let (Some(runtime), Some(context)) = (&self.runtime, &self.context) {
@@ -117,7 +134,7 @@ impl RquickjsGuest {
                 keep_collection_below_limit(runtime, context, self.heap_limit, self.threshold_set);
         }
     }
-    fn remember<T, E: std::fmt::Display>(
+    fn remember<T, E: core::fmt::Display>(
         &mut self,
         result: Result<T, E>,
     ) -> Result<T, RuntimeError> {
@@ -324,11 +341,18 @@ pub fn mount_ui<'js>(
     if !globals.contains_key("console")? {
         let console = Object::new(ctx.clone())?;
         for level in ["log", "info", "warn", "error", "debug"] {
+            #[cfg(not(feature = "std"))]
+            let log_level = match level {
+                "warn" => log::Level::Warn,
+                "error" => log::Level::Error,
+                "debug" => log::Level::Debug,
+                _ => log::Level::Info,
+            };
             console.set(
                 level,
                 Function::new(
                     ctx.clone(),
-                    |ctx: Ctx<'js>, Rest(values): Rest<Value<'js>>| -> rquickjs::Result<()> {
+                    move |ctx: Ctx<'js>, Rest(values): Rest<Value<'js>>| -> rquickjs::Result<()> {
                         let mut line = String::new();
                         for value in values {
                             if !line.is_empty() {
@@ -341,7 +365,10 @@ pub fn mount_ui<'js>(
                                 false,
                             )?);
                         }
+                        #[cfg(feature = "std")]
                         eprintln!("{line}");
+                        #[cfg(not(feature = "std"))]
+                        log::log!(log_level, "{line}");
                         Ok(())
                     },
                 )?,
@@ -430,8 +457,9 @@ struct BorrowedBytes<'js> {
 }
 impl BorrowedBytes<'_> {
     fn bytes(&self) -> rquickjs::Result<&[u8]> {
-        self.buffer
-            .as_bytes()
+        // Argument coercion has finished; invoke drops these borrows before
+        // constructing JS results or exceptions.
+        unsafe { self.buffer.as_bytes() }
             .and_then(|bytes| bytes.get(self.offset..self.offset + self.length))
             .ok_or(rquickjs::Error::new_from_js("detached buffer", "bytes"))
     }
@@ -494,13 +522,13 @@ fn string_value<'js>(
 ) -> rquickjs::Result<String> {
     let string = Coerced::<rquickjs::String>::from_js(ctx, value)?.0;
     let raw = string.to_cstring()?;
-    let bytes = unsafe { std::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), raw.len()) };
+    let bytes = unsafe { core::slice::from_raw_parts(raw.as_ptr().cast::<u8>(), raw.len()) };
     if empty_invalid {
-        return Ok(std::str::from_utf8(bytes).unwrap_or("").to_owned());
+        return Ok(core::str::from_utf8(bytes).unwrap_or("").to_owned());
     }
     match profile {
         BindingProfile::Canonical => Ok(String::from_utf8_lossy(bytes).into_owned()),
-        BindingProfile::Idf => std::str::from_utf8(bytes)
+        BindingProfile::Idf => core::str::from_utf8(bytes)
             .map(str::to_owned)
             .map_err(|_| Exception::throw_internal(ctx, "invalid UTF-8")),
     }
@@ -612,9 +640,9 @@ fn invoke<'js>(
             ),
         });
     }
-    let result = ops
-        .dispatch(descriptor.id, &args)
-        .map_err(|_| Exception::throw_internal(ctx, "UI operation failed"))?;
+    let result = ops.dispatch(descriptor.id, &args);
+    drop(args);
+    let result = result.map_err(|_| Exception::throw_internal(ctx, "UI operation failed"))?;
     result_value(ctx, descriptor.result, result)
 }
 fn result_value<'js>(
@@ -631,7 +659,7 @@ fn result_value<'js>(
         (ResultKind::Integer, OpResult::Integer(value)) => value.into_js(ctx),
         (ResultKind::Real, OpResult::Real(value)) => value.into_js(ctx),
         (ResultKind::String | ResultKind::OptionalString, OpResult::Bytes(bytes)) => {
-            std::str::from_utf8(&bytes)
+            core::str::from_utf8(&bytes)
                 .map_err(|_| Exception::throw_internal(ctx, "invalid string result"))?
                 .into_js(ctx)
         }
