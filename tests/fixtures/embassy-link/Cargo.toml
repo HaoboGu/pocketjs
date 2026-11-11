@@ -7,7 +7,7 @@ publish = false
 [workspace]
 
 [dependencies]
-pocket-guest-quickjs = { path = "../../../engine/guest-quickjs" }
+pocket-guest-rquickjs = { path = "../../../engine/guest-rquickjs", default-features = false, features = ["rust-alloc", "bindgen"] }
 pocket-package = { path = "../../../engine/package" }
 pocket-raster = { path = "../../../engine/raster" }
 pocket-embassy = { path = "../../../platforms/embassy" }

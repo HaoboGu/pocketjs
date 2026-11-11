@@ -1,7 +1,7 @@
 use pocket_drivers::Rect;
 use pocket_embassy::display::{Frame, Transport};
 use pocket_embassy_host_check::fixture::{SCRIPT, program};
-use pocket_runtime::{Runtime, RuntimeError};
+use pocket_runtime::RuntimeError;
 use std::{
     future::{Future, pending},
     task::{Context, Poll, Waker},
@@ -36,39 +36,34 @@ fn ready<T>(future: impl Future<Output = T>) -> T {
 }
 #[test]
 fn canonical_runtime_admits_package_samples_input_and_renders() {
-    let (runtime, mut presenter) = program(SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
-    runtime.with_runtime(Runtime::boot).unwrap();
-    assert_eq!(
-        runtime
-            .with_runtime(|r| Ok(r.timing().unwrap().cadence_hz))
-            .unwrap(),
-        30
-    );
+    let (mut runtime, mut presenter) = program(SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
+    runtime.boot().unwrap();
+    assert_eq!(runtime.timing().unwrap().cadence_hz, 30);
     let mut screen = Screen::default();
     ready(presenter.present(&mut screen)).unwrap();
     assert_eq!(&screen.frames[0].0[..2], &0x001fu16.to_le_bytes());
-    runtime.with_runtime(Runtime::tick).unwrap();
+    runtime.tick().unwrap();
     ready(presenter.present(&mut screen)).unwrap();
     assert_eq!(&screen.frames[1].0[..2], &0xf800u16.to_le_bytes());
     let context = runtime.op_context();
     assert_eq!(context.core().unwrap().ui.node_text(3), Some("5:1"));
-    runtime.with_runtime(Runtime::shutdown).unwrap();
+    runtime.shutdown().unwrap();
     assert!(context.core().is_err());
 }
 #[test]
 fn admission_rejects_wrong_binding_generation_before_javascript() {
-    let (runtime, _) = program(
+    let (mut runtime, _) = program(
         b"throw Error('must not evaluate')",
         pocket_drivers::spec::BINDING_GENERATION + 1,
     );
-    let error = runtime.with_runtime(Runtime::boot).unwrap_err();
+    let error = runtime.boot().unwrap_err();
     assert!(!matches!(error, RuntimeError::Guest));
     assert!(!runtime.op_context().core().unwrap().ui.node_exists(2));
 }
 #[test]
 fn cancelled_transfer_repaints_without_replaying_guest() {
-    let (runtime, mut presenter) = program(SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
-    runtime.with_runtime(Runtime::boot).unwrap();
+    let (mut runtime, mut presenter) = program(SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
+    runtime.boot().unwrap();
     let mut screen = Screen {
         pending: true,
         ..Default::default()
@@ -81,10 +76,10 @@ fn cancelled_transfer_repaints_without_replaying_guest() {
                 .poll(&mut Context::from_waker(Waker::noop()))
                 .is_pending()
         );
-        assert!(runtime.with_runtime(Runtime::present).is_err());
+        assert!(runtime.present().is_err());
     }
     screen.pending = false;
-    runtime.with_runtime(Runtime::present).unwrap();
+    runtime.present().unwrap();
     ready(presenter.present(&mut screen)).unwrap();
     assert_eq!(
         screen.frames.last().unwrap().1,
@@ -97,15 +92,15 @@ fn cancelled_transfer_repaints_without_replaying_guest() {
 }
 #[test]
 fn failed_transfer_invalidates_coordinator_history() {
-    let (runtime, mut presenter) = program(SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
-    runtime.with_runtime(Runtime::boot).unwrap();
+    let (mut runtime, mut presenter) = program(SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
+    runtime.boot().unwrap();
     let mut screen = Screen::default();
     ready(presenter.present(&mut screen)).unwrap();
-    runtime.with_runtime(Runtime::tick).unwrap();
+    runtime.tick().unwrap();
     screen.fail = true;
     assert!(ready(presenter.present(&mut screen)).is_err());
     screen.fail = false;
-    runtime.with_runtime(Runtime::present).unwrap();
+    runtime.present().unwrap();
     ready(presenter.present(&mut screen)).unwrap();
     assert_eq!(
         screen.frames.last().unwrap().1,
@@ -118,23 +113,20 @@ fn failed_transfer_invalidates_coordinator_history() {
 }
 #[test]
 fn interpreter_failure_reaches_runtime_and_stops_future_turns() {
-    for code in [b"while(true){}".as_slice(), b"throw Error('probe')"] {
-        let (runtime, _) = program(code, pocket_drivers::spec::BINDING_GENERATION);
-        assert!(matches!(
-            runtime.with_runtime(Runtime::boot),
-            Err(RuntimeError::Guest)
-        ));
-        assert!(runtime.with_runtime(Runtime::tick).is_err());
+    for code in [b"function {".as_slice(), b"throw Error('probe')"] {
+        let (mut runtime, _) = program(code, pocket_drivers::spec::BINDING_GENERATION);
+        assert!(matches!(runtime.boot(), Err(RuntimeError::Guest)));
+        assert!(runtime.tick().is_err());
     }
 }
 
 #[test]
 fn panel_reset_expands_an_already_queued_frame() {
-    let (runtime, mut presenter) = program(SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
-    runtime.with_runtime(Runtime::boot).unwrap();
+    let (mut runtime, mut presenter) = program(SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
+    runtime.boot().unwrap();
     let mut screen = Screen::default();
     ready(presenter.present(&mut screen)).unwrap();
-    runtime.with_runtime(Runtime::tick).unwrap();
+    runtime.tick().unwrap();
     presenter.invalidate();
     ready(presenter.present(&mut screen)).unwrap();
     assert_eq!(

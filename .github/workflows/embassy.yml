@@ -4,8 +4,7 @@ on:
   pull_request:
     paths:
       - 'platforms/embassy/**'
-      - 'engine/guest-quickjs/**'
-      - 'tools/packaging/quickjs/**'
+      - 'engine/guest-rquickjs/**'
       - 'engine/runtime/**'
       - 'engine/drivers/**'
       - 'engine/raster/**'
@@ -24,18 +23,14 @@ jobs:
       - name: Install ARM C libraries and Rust target
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi libclang-dev
           rustup target add thumbv7em-none-eabihf
       - name: Check platform boundaries without a C engine
         run: |
           cargo test -p pocket-embassy --no-default-features --locked
-          cargo clippy -p pocket-embassy -p pocket-guest-quickjs --all-targets --locked --no-deps -- -D warnings
-      - name: Fetch pinned QuickJS-NG
-        run: |
-          git init "$RUNNER_TEMP/quickjs"
-          git -C "$RUNNER_TEMP/quickjs" fetch --depth 1 https://github.com/quickjs-ng/quickjs d8e1cc68f71fba2e084a18408ab2e6f9838b4d20
-          git -C "$RUNNER_TEMP/quickjs" checkout --detach FETCH_HEAD
-          echo "POCKET_QUICKJS_DIR=$RUNNER_TEMP/quickjs" >> "$GITHUB_ENV"
+          cargo clippy -p pocket-embassy -p pocket-guest-rquickjs --all-targets --locked --no-deps -- -D warnings
+      - name: Test the no_std guest
+        run: cargo test -p pocket-guest-rquickjs --no-default-features --features rust-alloc --locked
       - name: Test and lint the host
         run: |
           cargo test --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked
@@ -43,5 +38,4 @@ jobs:
           cargo run --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked
       - name: Link the bare-metal ARM fixture
         run: |
-          python3 tools/packaging/quickjs/prepare-baremetal.py --source "$POCKET_QUICKJS_DIR" --output "$RUNNER_TEMP/quickjs-baremetal"
-          POCKET_QUICKJS_DIR="$RUNNER_TEMP/quickjs-baremetal" python3 tests/fixtures/embassy-link/build.py thumbv7em-none-eabihf --cc arm-none-eabi-gcc
+          python3 tests/fixtures/embassy-link/build.py thumbv7em-none-eabihf --cc arm-none-eabi-gcc

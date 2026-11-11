@@ -44,8 +44,8 @@ loop {
 ```
 
 The program imports `BufferedDisplay` from `pocket_embassy::display` and `Ticker`
-from `pocket_embassy::runner`. A C guest uses `pocket_runtime::abi::Handle` and
-`with_runtime` for these runtime calls. The complete executable composition is in
+from `pocket_embassy::runner`. Register `RquickjsGuest::default()` through
+`Runtime::set_guest`. The complete executable composition is in
 [`tests/fixtures/embassy-host`](../../tests/fixtures/embassy-host).
 
 **Package admission and cadence selection remain in Runtime.** Pass its `Timing`
@@ -79,22 +79,31 @@ pacing and peripheral I/O. The crate does not impose a frame-time guarantee.
 
 ## Guest and build ownership
 
-Use any implementation of `pocket_runtime::Guest`. The optional
-[`pocket-guest-quickjs`](../../engine/guest-quickjs) Rust adapter owns the canonical
-C guest's realm. The program links its engine, runtime C exports and libc hooks.
-QuickJS toolchain details and source preparation are outside this platform crate.
+Use any implementation of `pocket_runtime::Guest`. The host and bare-metal fixtures
+use the existing [`pocket-guest-rquickjs`](../../engine/guest-rquickjs) with
+`default-features = false` and `rust-alloc`. The platform has no engine dependency.
 
-See the fixture commands below for a host build with that guest:
+`rquickjs-sys` compiles its bundled QuickJS-NG sources. For targets without shipped
+bindings, enable `bindgen` and provide libclang, a target C compiler, newlib headers
+and libraries. The program supplies the global allocator and clock hooks. None of
+these belong in `pocket-embassy`; no rquickjs source patch is required.
 
 ```sh
-export POCKET_QUICKJS_DIR=/absolute/path/to/quickjs-ng-0.16.2
 cargo test --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked
 cargo run --manifest-path tests/fixtures/embassy-host/Cargo.toml --release --locked
+python3 tests/fixtures/embassy-link/build.py thumbv7em-none-eabihf --cc arm-none-eabi-gcc
 ```
 
 The tests execute canonical package admission, input sampling and rendering. They
 check pixel changes, display token/region contracts, transfer cancellation/failure,
 and interpreter errors. The executable checks 30 Hz cadence selection and progress
 of another Embassy task during display waits. The separate
-[`embassy-link`](../../tests/fixtures/embassy-link) fixture verifies ARM/RISC-V
-linking; its inert clock and arena do not establish board support or DMA timing.
+[`embassy-link`](../../tests/fixtures/embassy-link) fixture links for ARM/RISC-V;
+its inert clock and arena do not establish board support or DMA timing.
+
+The link fixture enables newlib's clock and pthread declarations because QuickJS's
+shared utility header parses them. It disables JS Atomics; unused thread helpers
+are discarded, and no pthread implementation is supplied. The build rejects a
+remaining pthread dependency. A board port must select the matching ABI, provide
+working clocks, size its heap and stack, and configure its renderer and display.
+Embassy support does not imply that every Embassy chip can fit or link this engine.

@@ -2079,14 +2079,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pocket-guest-quickjs"
-version = "0.16.0"
-dependencies = [
- "pocket-drivers",
- "pocket-runtime",
-]
-
-[[package]]
 name = "pocket-guest-rquickjs"
 version = "0.16.0"
 dependencies = [

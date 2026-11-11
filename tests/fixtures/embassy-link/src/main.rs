@@ -11,7 +11,6 @@ use core::{
 #[path = "../../embassy-host/src/fixture.rs"]
 mod program;
 use pocket_embassy::display::{Frame, Transport};
-use pocket_runtime::Runtime;
 
 // Link-only fixture: this arena and inert clock are not a board support package.
 struct Bump;
@@ -59,12 +58,10 @@ impl Transport for Screen {
 }
 #[unsafe(no_mangle)]
 extern "C" fn _start() -> ! {
-    let (runtime, mut presenter) =
+    let (mut runtime, mut presenter) =
         program::program(program::SCRIPT, pocket_drivers::spec::BINDING_GENERATION);
-    runtime.with_runtime(Runtime::boot).unwrap();
-    let timing = runtime
-        .with_runtime(|runtime| Ok(runtime.timing().unwrap()))
-        .unwrap();
+    runtime.boot().unwrap();
+    let timing = runtime.timing().unwrap();
     let mut ticker = pocket_embassy::runner::Ticker::new(timing, 100_000).unwrap();
     {
         let mut next = core::pin::pin!(ticker.next());

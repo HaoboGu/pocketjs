@@ -1,12 +1,12 @@
 use alloc::{boxed::Box, vec};
 use pocket_drivers::{DisplayRole, InputFrameBuilder, InputSource, PixelFormat};
 use pocket_embassy::display::{BufferedDisplay, Presenter};
-use pocket_guest_quickjs::{Limits, QuickJsGuest};
+use pocket_guest_rquickjs::RquickjsGuest;
 use pocket_package::{
     embedded::{EmbeddedPackage, encode, identity},
     source::MemorySource,
 };
-use pocket_runtime::{Cow, InputClasses, Profile, RendererId, RuntimeConfig, abi::Handle};
+use pocket_runtime::{Cow, InputClasses, Profile, RendererId, Runtime, RuntimeConfig};
 
 pub fn config(viewport: [u32; 2]) -> RuntimeConfig {
     RuntimeConfig {
@@ -51,7 +51,7 @@ globalThis.frame = buttons => {
     ui.setText(status, `${buttons}:${++turns}`);
 };
 "#;
-pub fn program(code: &[u8], generation: u32) -> (Box<Handle>, Presenter) {
+pub fn program(code: &[u8], generation: u32) -> (Runtime, Presenter) {
     let config = config([24, 16]);
     let identity = identity("app", "embassy.fixture", "Embassy fixture").unwrap();
     let plan = r#"{"animation":"composited","profile":{"tickHz":30},"viewport":{"logical":[24,16],"presentation":"native","rasterDensity":1},"features":{}}"#;
@@ -65,18 +65,8 @@ pub fn program(code: &[u8], generation: u32) -> (Box<Handle>, Presenter) {
         pak: &[],
     })
     .unwrap();
-    let handle = Handle::new(config).unwrap();
-    let guest = unsafe {
-        QuickJsGuest::new(
-            handle.as_ptr(),
-            Limits {
-                heap_bytes: 1024 * 1024,
-                stack_bytes: 128 * 1024,
-                interrupt_polls: 256,
-            },
-        )
-    }
-    .unwrap();
+    let mut runtime = Runtime::new(config).unwrap();
+    let guest = RquickjsGuest::default();
     let (display, presenter) = BufferedDisplay::new(
         DisplayRole::Primary,
         24,
@@ -85,36 +75,17 @@ pub fn program(code: &[u8], generation: u32) -> (Box<Handle>, Presenter) {
         24 * 16 * 2,
     )
     .unwrap();
-    handle
-        .with_runtime(|runtime| {
-            runtime.set_package_source(Box::new(MemorySource(package)))?;
-            runtime.set_guest(Box::new(guest))?;
-            runtime.add_input_source(Box::new(Input(5)))?;
-            runtime.set_software_renderer(
-                pocket_raster::RasterRenderer::new(1).unwrap(),
-                pocket_raster::RasterRenderer::new,
-            )?;
-            runtime.add_display(display, RendererId::SOFTWARE)?;
-            Ok(())
-        })
+    runtime
+        .set_package_source(Box::new(MemorySource(package)))
         .unwrap();
-    (handle, presenter)
-}
-// Like the SDK archive, the program defines the C exports once per link unit.
-#[unsafe(no_mangle)]
-unsafe extern "C" fn pocket_runtime_op(
-    runtime: *mut pocket_drivers::abi::PocketRuntime,
-    op: u16,
-    args: *const core::ffi::c_void,
-    length: usize,
-    out: *mut pocket_drivers::abi::PocketResult,
-) -> i32 {
-    unsafe { pocket_runtime::abi::pocket_runtime_op(runtime, op, args, length, out) }
-}
-#[unsafe(no_mangle)]
-unsafe extern "C" fn pocket_runtime_supports_op(
-    runtime: *const pocket_drivers::abi::PocketRuntime,
-    op: u16,
-) -> u32 {
-    unsafe { pocket_runtime::abi::pocket_runtime_supports_op(runtime, op) }
+    runtime.set_guest(Box::new(guest)).unwrap();
+    runtime.add_input_source(Box::new(Input(5))).unwrap();
+    runtime
+        .set_software_renderer(
+            pocket_raster::RasterRenderer::new(1).unwrap(),
+            pocket_raster::RasterRenderer::new,
+        )
+        .unwrap();
+    runtime.add_display(display, RendererId::SOFTWARE).unwrap();
+    (runtime, presenter)
 }
