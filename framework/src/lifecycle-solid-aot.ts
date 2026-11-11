@@ -38,3 +38,5 @@ export function resetLifecycleHooks(): void {
   scheduler.reset(); roots = new WeakSet();
   for (const [region, entry] of [...models]) if (!region.disposed && region.initial) registerModelLifecycle(region, entry.root);
 }
+
+export function hasLifecycleWork(): boolean { return scheduler.hasPending(); }

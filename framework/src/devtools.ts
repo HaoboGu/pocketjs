@@ -186,6 +186,7 @@ interface DevtoolsState {
   /** Wrapper invocations — advances even while paused (poll cadence must
    *  not freeze with the world, or resume could never arrive on PSP). */
   hostCalls: number;
+  recordInput: boolean;
 }
 
 const state: DevtoolsState = {
@@ -220,6 +221,7 @@ const state: DevtoolsState = {
   saidHello: false,
   panelAttached: false,
   hostCalls: 0,
+  recordInput: true,
 };
 
 // ---------------------------------------------------------------------------
@@ -264,6 +266,7 @@ export function initDevtools(ops: HostOps): void {
   state.saidHello = false;
   state.panelAttached = false;
   state.hostCalls = 0;
+  state.recordInput = (globalThis as { __pocketRecordInput?: boolean }).__pocketRecordInput !== false;
   state.app = (globalThis as { __pocketApp?: string }).__pocketApp;
 
   const injected = (globalThis as { __pocketDevtoolsTransport?: DevtoolsTransport })
@@ -383,7 +386,7 @@ export function wrapFrameHandler(
     }
     axisDeltas = __takeAxisDeltas(axisDeltas);
     motion = __takeMotionState(motion);
-    recordMask(mask, analog, touch, touchSurfaces, rightAnalog, axisDeltas, motion);
+    if (state.recordInput) recordMask(mask, analog, touch, touchSurfaces, rightAnalog, axisDeltas, motion);
     state.frame++;
     try {
       h(mask, analog, touch, hits, touchSurfaces, rightAnalog, axisDeltas, motion, textArg);

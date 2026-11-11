@@ -194,3 +194,5 @@ export function createSpriteAnimation(frames: readonly string[], opts: SpriteAni
   });
   return () => frames[Math.floor(frame() / frameStep) % frames.length];
 }
+
+export function hasFrameHooks(): boolean { const a = registry.freeze(), b = systemRegistry.freeze(); return a.callbacks.length > 0 || a.placed.length > 0 || b.callbacks.length > 0 || b.placed.length > 0; }

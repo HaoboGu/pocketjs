@@ -138,3 +138,5 @@ export function __advanceClock(): void {
   for (const t of timers) if (t.at < nextDue) nextDue = t.at;
   for (const t of due) t.cb();
 }
+
+export function hasTimers(): boolean { return timers.length > 0; }

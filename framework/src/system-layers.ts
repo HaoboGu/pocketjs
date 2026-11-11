@@ -59,3 +59,5 @@ export function filterFrameInput(
   filter(input);
   return input;
 }
+
+export function hasSystemLayers(): boolean { return layers.length > 0 || filter !== null; }

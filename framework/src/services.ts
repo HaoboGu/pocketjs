@@ -20,3 +20,5 @@ export function runServicePumps(): void {
   // the next entry without a snapshot allocation on this per-frame path.
   for (const pump of pumps) pump();
 }
+
+export function hasServicePumps(): boolean { return pumps.size > 0; }

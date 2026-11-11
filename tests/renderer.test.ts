@@ -50,6 +50,8 @@ import {
   retain,
   runSweep,
   setProp,
+  createClassBinding,
+  setClassBinding,
   setStyleResolver,
   type NodeMirror,
 } from "../framework/src/renderer.ts";
@@ -57,6 +59,7 @@ import {
   registerStyles,
   resetStyles,
   resolveStyle,
+  styleRevision,
 } from "../framework/src/styles.ts";
 import {
   getFocused,
@@ -92,7 +95,7 @@ import { getAuxiliarySurfaceRoots } from "../framework/src/display.ts";
 import { ClassicButton, ClassicSheet } from "../framework/src/classic.ts";
 import { __runGestures, resetGestures, pushTouchBlock } from "../framework/src/gesture.ts";
 import { __packTouch, __setTouches, __resetTouches } from "../framework/src/touch.ts";
-import { __advanceClock, resetClock } from "../framework/src/clock.ts";
+import { __advanceClock, resetClock, after } from "../framework/src/clock.ts";
 import {
   DeepZoom,
   type DeepZoomGesture,
@@ -1929,4 +1932,76 @@ test("Text resource swaps one complete value and unsubscribes from superseded ba
   second.publish(failed("offline")); runSweep();
   expect(host.of("setText").some(c => c[2] === "Error")).toBe(true);
   dispose(); expect(second.listeners.size).toBe(0);
+});
+
+
+test("idle frame fast path preserves callbacks, timers and released buttons", () => {
+  const g = globalThis as { ui?: HostOps; frame?: (buttons: number) => void; __pocketNeedsFrame?: boolean };
+  g.ui = host.ops;
+  let ticks = 0, presses = 0;
+  const dispose = publicMount(() => {
+    onFrame(() => ticks++);
+    onButtonPress(BTN.SELECT, () => presses++);
+    return View({});
+  });
+  expect(g.__pocketNeedsFrame).toBe(true);
+  g.frame!(BTN.SELECT); g.frame!(0); g.frame!(BTN.SELECT);
+  expect(ticks).toBe(3); expect(presses).toBe(2);
+  dispose();
+});
+
+test("string length counts code points and preserves unpaired surrogates", async () => {
+  const { len } = await import("../framework/src/std-microts.ts");
+  for (const [text, count] of [["", 0], ["A", 1], ["Enter", 5], ["汉字", 2], ["A😀B", 3], ["\ud800x", 2], ["\udc00", 1], ["\ud800\ud800\udc00", 2]] as const) {
+    expect(len(text)).toBe(count);
+  }
+  expect(len([1, 2, 3])).toBe(3);
+});
+
+test("idle frames still deliver scheduled timers", () => {
+  const g = globalThis as { ui?: HostOps; frame?: (buttons: number) => void; __pocketNeedsFrame?: boolean };
+  g.ui = host.ops;
+  const dispose = publicMount(() => View({}));
+  let fired = 0;
+  after(2 / 60, () => fired++);
+  expect(g.__pocketNeedsFrame).toBe(true);
+  g.frame!(0); g.frame!(0); g.frame!(0);
+  expect(fired).toBe(1);
+  expect(g.__pocketNeedsFrame).toBe(false);
+  dispose();
+});
+
+
+test("compiled classes preserve attributes and invalidate on style registration", () => {
+  registerStyles({ "p-2": 1 });
+  let lookups = 0;
+  const resolver = (value: string) => { lookups++; return resolveStyle(value); };
+  setStyleResolver(resolver, styleRevision);
+  const node = createElement("view"), binding = createClassBinding("  p-2  ");
+  setClassBinding(node, binding);
+  setClassBinding(node, binding);
+  expect(lookups).toBe(1);
+  expect(node.domAttrs?.class).toBe("  p-2  ");
+  expect(host.of("setStyle").at(-1)).toEqual(["setStyle", node.id, 1]);
+  registerStyles({ "p-2": 7 });
+  setClassBinding(node, binding);
+  expect(lookups).toBe(2);
+  expect(host.of("setStyle").at(-1)).toEqual(["setStyle", node.id, 7]);
+  setStyleResolver(resolver, styleRevision);
+  setClassBinding(node, binding);
+  expect(lookups).toBe(3);
+  setClassBinding(node, createClassBinding(""));
+  expect(node.domAttrs?.class).toBe("");
+  expect(host.of("setStyle").at(-1)).toEqual(["setStyle", node.id, STYLE_ID_NONE]);
+});
+
+test("compiled classes preserve custom resolver and unknown-class behavior", () => {
+  let id = 0;
+  setStyleResolver(() => ++id);
+  const node = createElement("view"), binding = createClassBinding("p-2");
+  setClassBinding(node, binding);
+  setClassBinding(node, binding);
+  expect(host.of("setStyle").slice(-2)).toEqual([["setStyle", node.id, 1], ["setStyle", node.id, 2]]);
+  setStyleResolver(resolveStyle, styleRevision);
+  expect(() => setClassBinding(node, binding)).toThrow("unknown class");
 });

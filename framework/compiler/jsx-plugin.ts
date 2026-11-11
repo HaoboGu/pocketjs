@@ -1,6 +1,7 @@
 // Framework-aware pass-1 Babel transform + AST collection.
 
 import { transformAsync, type PluginObj } from "@babel/core";
+import * as t from "@babel/types";
 import type { ParserOptions } from "@babel/parser";
 import solidPreset from "babel-preset-solid";
 import tsPreset from "@babel/preset-typescript"; // untyped - see framework/compiler/ambient.d.ts
@@ -324,7 +325,105 @@ function makeCollector(out: Collected, framework: PocketFramework): PluginObj {
     name: "pocketjs-collect",
     visitor: {
       Program: {
+        exit(program) {
+          if (framework !== "solid") return;
+          program.scope.crawl();
+          const literals = new Map<string, t.Identifier>();
+          const create = program.scope.generateUidIdentifier("createClassBinding");
+          const apply = program.scope.generateUidIdentifier("setClassBinding");
+          const declarations: t.VariableDeclarator[] = [];
+          const eligible = (node: t.Node): boolean =>
+            t.isStringLiteral(node) ? classNodes.has(node) :
+            t.isConditionalExpression(node) && eligible(node.consequent) && eligible(node.alternate);
+          const lower = (node: t.Expression): t.Expression => {
+            if (t.isConditionalExpression(node)) {
+              return t.conditionalExpression(node.test, lower(node.consequent), lower(node.alternate));
+            }
+            const value = (node as t.StringLiteral).value;
+            let id = literals.get(value);
+            if (!id) {
+              id = program.scope.generateUidIdentifier("classBinding");
+              literals.set(value, id);
+              declarations.push(t.variableDeclarator(id, t.callExpression(create, [t.stringLiteral(value)])));
+            }
+            return t.cloneNode(id);
+          };
+          program.traverse({
+            CallExpression(path) {
+              const { callee, arguments: args } = path.node;
+              if (!t.isIdentifier(callee) || args.length < 3 || !t.isStringLiteral(args[1], { value: "class" })) return;
+              const setter = path.scope.getBinding(callee.name)?.path;
+              if (!setter?.isImportSpecifier() || !t.isIdentifier(setter.node.imported, { name: "setProp" })) return;
+              const declaration = setter.parentPath;
+              if (!declaration.isImportDeclaration() || declaration.node.source.value !== FRAMEWORKS.solid.rendererPath) return;
+              let value = args[2];
+              let variable: t.VariableDeclarator | undefined;
+              if (t.isIdentifier(value)) {
+                const binding = path.scope.getBinding(value.name)?.path;
+                if (!binding?.isVariableDeclarator() || !binding.node.init) return;
+                variable = binding.node;
+                value = binding.node.init;
+              }
+              if (!t.isExpression(value) || !eligible(value)) return;
+              if (variable) variable.init = lower(value);
+              else args[2] = lower(value);
+              path.node.callee = t.cloneNode(apply);
+              args.splice(1, 1);
+            },
+          });
+          if (declarations.length) {
+            program.node.body.unshift(t.importDeclaration([
+              t.importSpecifier(create, t.identifier("createClassBinding")),
+              t.importSpecifier(apply, t.identifier("setClassBinding")),
+            ], t.stringLiteral(FRAMEWORKS.solid.rendererPath)));
+            const firstStatement = program.node.body.findIndex(node => !t.isImportDeclaration(node));
+            program.node.body.splice(firstStatement, 0, t.variableDeclaration("const", declarations));
+          }
+        },
         enter(program) {
+          if (framework === "solid") program.traverse({
+            JSXExpressionContainer(path) {
+              const parent = path.parentPath;
+              if (!parent.isJSXElement()) return;
+              const tag = parent.node.openingElement.name;
+              if (tag.type !== "JSXIdentifier") return;
+              if (tag.name !== "text") {
+                const binding = path.scope.getBinding(tag.name);
+                if (!binding?.path.isImportSpecifier()) return;
+                const imported = binding.path.node.imported;
+                const declaration = binding.path.parentPath;
+                if (!t.isIdentifier(imported, { name: "Text" }) || !declaration.isImportDeclaration() ||
+                    !["@pocketjs/framework/components", "@pocketjs/framework/solid/components"].includes(declaration.node.source.value)) return;
+              }
+              const scalar = (value: t.Node): boolean => {
+                if (t.isStringLiteral(value) || t.isNumericLiteral(value)) return true;
+                if (t.isTemplateLiteral(value)) {
+                  let containsNodes = false;
+                  t.traverseFast(value, child => { if (t.isJSXElement(child) || t.isJSXFragment(child)) containsNodes = true; });
+                  return !containsNodes;
+                }
+                if (t.isConditionalExpression(value)) return scalar(value.consequent) && scalar(value.alternate);
+                if (t.isMemberExpression(value) && !value.computed && t.isIdentifier(value.object) && t.isIdentifier(value.property)) {
+                  const property = value.property.name;
+                  const binding = path.scope.getBinding(value.object.name);
+                  const object = binding?.path.node;
+                  const annotation = object && t.isIdentifier(object) && object.typeAnnotation?.type === "TSTypeAnnotation" ? object.typeAnnotation.typeAnnotation : undefined;
+                  if (annotation && t.isTSTypeLiteral(annotation)) {
+                    const member = annotation.members.find(member => t.isTSPropertySignature(member) && t.isIdentifier(member.key, { name: property }));
+                    if (member && t.isTSPropertySignature(member) && !member.optional) {
+                      const type = member.typeAnnotation?.typeAnnotation;
+                      return !!type && (t.isTSStringKeyword(type) || t.isTSNumberKeyword(type));
+                    }
+                  }
+                }
+                return false;
+              };
+              const expression = path.node.expression;
+              if (t.isConditionalExpression(expression) && scalar(expression)) {
+                path.node.expression = t.callExpression(t.arrowFunctionExpression([], expression), []);
+              }
+            },
+          });
           // First, so every literal below knows whether a class attribute holds it.
           program.traverse({
             JSXAttribute(path) {

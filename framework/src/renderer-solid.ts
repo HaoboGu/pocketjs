@@ -27,6 +27,8 @@ import {
   rootMirror,
   runSweep,
   setProp,
+  createClassBinding,
+  setClassBinding,
   setStyleResolver,
   type HostProps,
   type NodeMirror,
@@ -52,6 +54,8 @@ export {
   rootMirror,
   runSweep,
   setProp,
+  createClassBinding,
+  setClassBinding,
   setStyleResolver,
   type NodeMirror,
 };

@@ -22,6 +22,7 @@ export function createLifecycleScheduler(batch: (run: () => void) => void, updat
     }
   };
   return {
+    hasPending(): boolean { return dirty; },
     register(callback: () => void, phase: "mount" | "unmount"): () => void {
       const hook: LifecycleHook = { sequence: sequence++, [phase]: callback, destroyed: false, mounted: false };
       hooks.add(hook);

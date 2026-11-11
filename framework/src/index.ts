@@ -1,3 +1,16 @@
+import { hasFrameHooks } from "./frame.ts";
+import { hasModelRegions } from "./model-reactive.ts";
+import { hasModelTasks } from "./model-tasks.ts";
+import { hasServicePumps } from "./services.ts";
+import { hasEffectDeliveries } from "./effects.ts";
+import { hasTimers } from "./clock.ts";
+import { hasSystemLayers } from "./system-layers.ts";
+import { hasLifecycleWork } from "./lifecycle-solid-aot.ts";
+
+function pendingFrameWork(): boolean {
+  return hasFrameHooks() || hasModelRegions() || hasModelTasks() || hasServicePumps() ||
+    hasEffectDeliveries() || hasLifecycleWork() || hasSystemLayers();
+}
 // PocketJS runtime entry: render(<App/>) / mount(<App/>).
 //
 // Frame contract (every host): once per vblank/rAF tick the host calls
@@ -40,7 +53,7 @@ import {
 } from "./renderer.ts";
 import { setOverlayRoot } from "./overlay.ts";
 import { mountAuxiliarySurface, unmountAuxiliarySurface } from "./display.ts";
-import { registerStyles, resolveStyle } from "./styles.ts";
+import { registerStyles, resolveStyle, styleRevision } from "./styles.ts";
 import { handleFrame, setAuxiliaryHitRoot, setHitRoot, setInputRoot, withDeferredPress, type DeferredPress } from "./input.ts";
 import { __runGestures, resetGestures } from "./gesture.ts";
 import { installTouchActivation } from "./touch-activation.ts";
@@ -186,7 +199,7 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
   const host = detectHost(opts.ops);
   installHost(host);
 
-  setStyleResolver(resolveStyle);
+  setStyleResolver(resolveStyle, styleRevision);
   if (opts.styles) registerStyles(opts.styles);
 
   const nativeTextureTable = host.kind === "native"
@@ -277,6 +290,10 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
   resetEffects();
   initDevtools(host.ops); // DevTools shim (docs/DEVTOOLS.md): flight recorder +
   // debug channel; one branch per frame when no transport is connected.
+  Object.defineProperty(globalThis, "__pocketNeedsFrame", {
+    configurable: true, get: () => hasTimers() || pendingFrameWork(),
+  });
+  let previousInput = false;
   installFrameHandler(
     wrapFrameHandler((
       buttons: number,
@@ -290,6 +307,11 @@ export function render(code: () => unknown, opts: RenderOptions = {}): () => voi
       text?: readonly TextEventRecord[],
     ) => {
       __advanceClock(); // virtual frame++, fire due after() timers
+      const input = buttons !== 0 || analog !== 0x8080 || (rightAnalog !== undefined && rightAnalog !== 0x8080) ||
+        !!touches?.length || !!hits?.length || !!touchSurfaces?.length || !!axisDeltas?.length || !!motion || !!text?.length;
+      const canSkip = !input && !previousInput && !pendingFrameWork();
+      previousInput = input;
+      if (canSkip) { runSweep(); return; }
       // A system layer may take the frame's input first (system-layers.ts).
       const filtered = filterFrameInput(buttons, touches, hits, touchSurfaces);
       if (filtered !== null) {

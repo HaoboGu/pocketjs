@@ -147,3 +147,5 @@ export function initialModelRegions(): boolean {
   for (const region of liveModelRegions()) if (region.initial) { region.react(true); region.settle(); ran = true; }
   return ran;
 }
+
+export function hasModelRegions(): boolean { return regions.size > 0; }

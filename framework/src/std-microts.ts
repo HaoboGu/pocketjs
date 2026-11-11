@@ -27,9 +27,15 @@ export type MicroTsPlainNumber = number & { readonly __type?: never; readonly __
 export type MicroTsNumericResult<T extends number> = T extends MicroTsPlainNumber ? number : T;
 
 export function len<T>(value: string | readonly T[]): i32 {
-  if (typeof value !== "string") return value.length;
-  let count = 0;
-  for (const _ of value) count++;
+  const units = value.length;
+  if (typeof value !== "string" || units < 2) return units;
+  let count = units;
+  for (let i = 0; i + 1 < units; i++) {
+    const first = value.charCodeAt(i);
+    if (first < 0xd800 || first > 0xdbff) continue;
+    const second = value.charCodeAt(i + 1);
+    if (second >= 0xdc00 && second <= 0xdfff) { count--; i++; }
+  }
   return count;
 }
 

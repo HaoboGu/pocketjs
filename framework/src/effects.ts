@@ -116,3 +116,5 @@ export function __drainEffects(): void {
     (entry.onResult as (r: unknown) => void)(result);
   }
 }
+
+export function hasEffectDeliveries(): boolean { return queue.length > 0; }

@@ -236,3 +236,5 @@ export function resumeModelTasks(frame = virtualFrame() + 1, now = virtualNow() 
   const ready = [...taskRuntimes].sort((a, b) => a.region.instance - b.region.instance).flatMap(runtime => runtime.snapshot(frame, now, values));
   for (const run of ready) run();
 }
+
+export function hasModelTasks(): boolean { return taskRuntimes.size > 0 || deliveries.length > 0 || commands.length > 0; }

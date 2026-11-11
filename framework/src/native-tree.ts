@@ -314,10 +314,51 @@ export function decorateNativeNode(node: NodeMirror): NodeMirror {
 decorateNativeNode(rootMirror);
 
 let styleResolver: ((cls: string) => number | undefined) | null = null;
+let styleRevision: (() => number) | undefined;
+let styleResolverEpoch = 0;
 
 /** Wire the class->styleId lookup (index.ts injects styles.ts's resolveStyle). */
-export function setStyleResolver(fn: (cls: string) => number | undefined): void {
+export function setStyleResolver(fn: (cls: string) => number | undefined, revision?: () => number): void {
   styleResolver = fn;
+  styleRevision = revision;
+  styleResolverEpoch++;
+}
+
+/** Compiler-owned literal binding; resolution follows the current style table. */
+export interface ClassBinding {
+  value: string;
+  id: number | undefined;
+  epoch: number;
+  revision: number | undefined;
+}
+export function createClassBinding(value: string): ClassBinding {
+  return { value, id: undefined, epoch: -1, revision: undefined };
+}
+export function setClassBinding(node: NodeMirror, binding: ClassBinding, previous?: ClassBinding): ClassBinding {
+  if (binding === previous) return binding;
+  domAttrs(node).class = binding.value;
+  const ops = getOps();
+  treeMutated();
+  if (binding.value === "") {
+    ops.setStyle(node.id, STYLE_ID_NONE);
+    return binding;
+  }
+  const revision = styleRevision?.();
+  if (revision === undefined || binding.revision !== revision || binding.epoch !== styleResolverEpoch) {
+    binding.id = styleResolver?.(binding.value);
+    binding.epoch = styleResolverEpoch;
+    binding.revision = revision;
+  }
+  if (binding.id === undefined) {
+    if (getHost().strict) {
+      throw new Error(`PocketJS: unknown class "${binding.value}" - not in the compiled style table ` +
+        "(dynamic classes must be ternaries of full literals)");
+    }
+    missCounters.unknownClass++;
+  } else {
+    ops.setStyle(node.id, binding.id);
+  }
+  return binding;
 }
 
 /** Non-strict-host miss counters (PSP: don't crash, count). */
