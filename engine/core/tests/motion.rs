@@ -68,8 +68,10 @@ fn move_pixels(pixels: &mut [u16], width: u32, motion: DamageMotion) {
 fn play(ui: &mut Ui, frames: usize, mut step: impl FnMut(&mut Ui, usize)) -> usize {
     let (width, height) = (W * SCALE, H * SCALE);
     let mut tracker = DamageTracker::<8>::new();
+    let mut repaint_tracker = DamageTracker::<8>::new();
     let target = DamageTarget::new(width, height, SCALE, 1);
     let mut pixels = vec![0u16; (width * height) as usize];
+    let mut repaint_pixels = pixels.clone();
     let mut moved = 0;
     for frame in 0..frames {
         step(ui, frame);
@@ -85,6 +87,13 @@ fn play(ui: &mut Ui, frames: usize, mut step: impl FnMut(&mut Ui, usize)) -> usi
         let mut expected = vec![0u16; pixels.len()];
         render_scaled_rgb565(&*ui, &words, &mut expected, SCALE);
         assert!(pixels == expected, "frame {frame} differs from a full render");
+        let repaint = repaint_tracker.prepare_cached(&*ui, &words, target).unwrap();
+        assert!(repaint.motion().is_none());
+        if let Some(commands) = repaint_tracker.prepared_commands() {
+            pocket_raster::render_prepared_rgb565_regions(&*ui, commands, &mut repaint_pixels, SCALE, repaint.regions());
+        }
+        repaint_tracker.commit(&*ui, &words, target);
+        assert!(repaint_pixels == expected, "cached repaint frame {frame} differs from a full render");
     }
     moved
 }

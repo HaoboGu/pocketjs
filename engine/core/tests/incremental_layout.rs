@@ -558,3 +558,264 @@ fn seeded_mixed_mutations_match_a_fresh_solver_every_frame() {
         pair.check(&format!("step {step}, seed {seed:08x}"));
     }
 }
+
+#[test]
+fn absolute_leaf_updates_match_general_layout_without_resolving_the_tree() {
+    let mut pair = Pair::new();
+    pair.live.set_fast_absolute_layout(true);
+    let (parent, label, sibling) = pair.edit(|ui| {
+        let parent = view(ui, spec::ROOT_ID, Some(125.25), Some(82.5));
+        set(
+            ui,
+            parent,
+            &[
+                (POS_TYPE, spec::PosType::Absolute as u8 as f64),
+                (INSET_L, 2.25),
+                (INSET_T, 3.75),
+                (PADDING_L, 2.5),
+            ],
+        );
+        let label = text(ui, parent, "ab");
+        set(
+            ui,
+            label,
+            &[
+                (POS_TYPE, spec::PosType::Absolute as u8 as f64),
+                (INSET_L, 3.25),
+                (INSET_T, 4.75),
+                (WIDTH, 43.5),
+            ],
+        );
+        let sibling = view(ui, parent, Some(17.5), Some(20.25));
+        set(
+            ui,
+            sibling,
+            &[
+                (POS_TYPE, spec::PosType::Absolute as u8 as f64),
+                (INSET_R, 5.25),
+                (INSET_B, 7.75),
+            ],
+        );
+        (parent, label, sibling)
+    });
+    pair.check("initial absolute leaves");
+    pair.live.reset_counters();
+    pair.edit(|ui| ui.set_text(label, "abab"));
+    pair.check("text update");
+    assert_eq!(pair.live.layout_counters().layout_passes, 0);
+    assert_eq!(pair.live.layout_counters().measure_callbacks, 0);
+    for (node, prop, value) in [
+        (label, INSET_T, 9.25),
+        (label, LINE_HEIGHT, 12.5),
+        (label, WIDTH, f64::NAN),
+        (label, INSET_R, 8.5),
+        (label, INSET_L, f64::NAN),
+        (sibling, WIDTH, 29.25),
+        (parent, WIDTH, 111.75),
+        (parent, INSET_L, 7.5),
+        (parent, DISPLAY, spec::Display::None as u8 as f64),
+        (parent, DISPLAY, spec::Display::Flex as u8 as f64),
+        (label, MARGIN_L, 3.0),
+        (label, MARGIN_L, 0.0),
+        (label, WIDTH, -1.0),
+        (label, WIDTH, 31.25),
+        (label, TRACKING, -0.5),
+        (label, TRACKING, 0.0),
+        (label, POS_TYPE, spec::PosType::Relative as u8 as f64),
+        (label, POS_TYPE, spec::PosType::Absolute as u8 as f64),
+    ] {
+        pair.edit(|ui| ui.set_prop(node, prop, value));
+        pair.check(&format!("property {prop}={value}"));
+    }
+    pair.edit(|ui| {
+        assert!(ui.load_font_atlas(&atlas(7)));
+    });
+    pair.check("font replacement");
+    pair.edit(|ui| ui.set_text(label, ""));
+    pair.check("empty run");
+    pair.edit(|ui| ui.set_text(label, "baba"));
+    pair.check("restore run");
+    pair.edit(|ui| ui.insert_before(spec::ROOT_ID, label, 0));
+    pair.check("move to another parent");
+    pair.edit(|ui| ui.insert_before(parent, label, 0));
+    pair.check("move back");
+    pair.edit(|ui| ui.set_prop(parent, CONTAIN, spec::Contain::Strict as u8 as f64));
+    pair.check("contained solver fallback");
+    pair.edit(|ui| ui.set_prop(parent, CONTAIN, spec::Contain::None as u8 as f64));
+    pair.check("leave containment");
+}
+
+#[test]
+fn absolute_text_absorbs_previously_positioned_inline_nodes() {
+    let mut pair = Pair::new();
+    pair.live.set_fast_absolute_layout(true);
+    let (outer, inner) = pair.edit(|ui| {
+        let outer = text(ui, spec::ROOT_ID, "a");
+        let inner = text(ui, spec::ROOT_ID, "b");
+        for node in [outer, inner] {
+            set(
+                ui,
+                node,
+                &[
+                    (POS_TYPE, spec::PosType::Absolute as u8 as f64),
+                    (INSET_L, 4.0),
+                    (INSET_T, 5.0),
+                ],
+            );
+        }
+        (outer, inner)
+    });
+    pair.check("separate texts");
+    pair.edit(|ui| ui.insert_before(outer, inner, 0));
+    pair.check("absorbed text");
+}
+
+#[test]
+fn seeded_absolute_geometry_and_fallbacks_match_full_layout() {
+    let mut pair = Pair::new();
+    pair.live.set_fast_absolute_layout(true);
+    let (parent, label) = pair.edit(|ui| {
+        let parent = view(ui, spec::ROOT_ID, None, None);
+        set(ui, parent, &[(PADDING_L, 2.25), (PADDING_T, 3.75)]);
+        let label = text(ui, parent, "ab");
+        set(
+            ui,
+            label,
+            &[
+                (POS_TYPE, spec::PosType::Absolute as u8 as f64),
+                (INSET_L, 1.25),
+                (INSET_T, 2.75),
+            ],
+        );
+        (parent, label)
+    });
+    pair.check("auto parent with absolute child");
+    let props = [
+        WIDTH,
+        HEIGHT,
+        INSET_L,
+        INSET_R,
+        INSET_T,
+        INSET_B,
+        MIN_W,
+        MAX_H,
+        MARGIN_L,
+        PADDING_T,
+        LINE_HEIGHT,
+        TRACKING,
+        DISPLAY,
+        POS_TYPE,
+    ];
+    let mut seed = 0x31cafeu32;
+    for step in 0..1024 {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        let property = props[seed as usize % props.len()];
+        let value = match property {
+            DISPLAY | POS_TYPE => ((seed >> 9) & 1) as f64,
+            TRACKING => {
+                if seed & 16 == 0 {
+                    0.0
+                } else {
+                    -0.5
+                }
+            }
+            MARGIN_L | PADDING_T => {
+                if seed & 16 == 0 {
+                    0.0
+                } else {
+                    2.5
+                }
+            }
+            _ => match seed >> 12 & 7 {
+                0 => f64::NAN,
+                1 => -1.0,
+                2 => -0.0,
+                _ => (seed % 337) as f64 / 13.0,
+            },
+        };
+        let node = if step % 9 == 0 { parent } else { label };
+        pair.edit(|ui| ui.set_prop(node, property, value));
+        if step % 13 == 0 {
+            pair.edit(|ui| ui.set_text(label, if step % 26 == 0 { "aba" } else { "ab\nba" }));
+        }
+        pair.check(&format!(
+            "case {step}: node {node} prop {property} value {value}"
+        ));
+    }
+    let aux = pair.edit(|ui| ui.create_auxiliary_surface(100.0, 90.0));
+    pair.edit(|ui| ui.insert_before(aux, parent, 0));
+    pair.check("move to auxiliary");
+    pair.edit(|ui| ui.insert_before(spec::ROOT_ID, parent, 0));
+    pair.check("move back from auxiliary");
+}
+
+#[test]
+fn equal_text_measurements_preserve_solver_cache() {
+    let mut pair = Pair::new();
+    let label = pair.edit(|ui| text(ui, spec::ROOT_ID, "ab"));
+    pair.check("initial measured size");
+    pair.live.reset_counters();
+    pair.edit(|ui| ui.set_text(label, "ba"));
+    pair.check("different text with equal measurements");
+    assert_eq!(pair.live.layout_counters().layout_passes, 0);
+    pair.edit(|ui| ui.set_text(label, "baba"));
+    pair.check("different measured size");
+    assert!(pair.live.layout_counters().layout_passes > 0);
+}
+
+#[test]
+fn eligible_absolute_axes_match_full_solver_without_flex_passes() {
+    let mut pair = Pair::new();
+    pair.live.set_fast_absolute_layout(true);
+    let label = pair.edit(|ui| {
+        let parent = view(ui, spec::ROOT_ID, Some(130.25), Some(87.75));
+        set(ui, parent, &[(PADDING_L, 7.5), (PADDING_T, 3.25)]);
+        let label = text(ui, parent, "abab");
+        set(
+            ui,
+            label,
+            &[
+                (POS_TYPE, spec::PosType::Absolute as u8 as f64),
+                (INSET_L, 0.0),
+                (INSET_T, 0.0),
+            ],
+        );
+        label
+    });
+    pair.check("initial supported leaf");
+    for step in 0..512 {
+        let x = (step % 43) as f64 / 13.0 - 2.0;
+        let y = (step % 37) as f64 / 11.0 - 3.0;
+        let width = [f64::NAN, 0.0, 37.25, 49.6][step % 4];
+        let height = [f64::NAN, 0.0, 19.25, 27.6][step / 4 % 4];
+        let left = if step & 16 == 0 { x } else { f64::NAN };
+        let right = if step & 32 == 0 || left.is_nan() {
+            x + 1.5
+        } else {
+            f64::NAN
+        };
+        let top = if step & 64 == 0 { y } else { f64::NAN };
+        let bottom = if step & 128 == 0 || top.is_nan() {
+            y + 2.5
+        } else {
+            f64::NAN
+        };
+        pair.live.reset_counters();
+        pair.edit(|ui| {
+            set(
+                ui,
+                label,
+                &[
+                    (WIDTH, width),
+                    (HEIGHT, height),
+                    (INSET_L, left),
+                    (INSET_R, right),
+                    (INSET_T, top),
+                    (INSET_B, bottom),
+                ],
+            )
+        });
+        pair.check(&format!("eligible case {step}"));
+        assert_eq!(pair.live.layout_counters().layout_passes, 0, "case {step}");
+    }
+}

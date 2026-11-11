@@ -5341,3 +5341,167 @@ fn package_textures_without_their_pixels_draw_nothing() {
     assert_eq!(ui.texture(tex).unwrap().pixels[0], 3);
     assert!(ui.update_texture_rect(tex, 0, 0, 1, 1, &[0; 4]));
 }
+
+#[test]
+fn retained_subtree_commands_match_a_fresh_walk_after_mutations() {
+    use spec::prop as p;
+    let mut ui = Ui::new();
+    ui.set_draw_cache_enabled(true);
+    assert!(ui.load_font_atlas(&encode_atlas(
+        0,
+        8,
+        8,
+        7,
+        10,
+        2,
+        &[('A' as u32, 0, 6), ('B' as u32, 1, 5)]
+    )));
+    let panel = ui.create_node(spec::NodeType::View as u8);
+    ui.insert_before(spec::ROOT_ID, panel, 0);
+    for (prop, value) in [
+        (p::WIDTH, 90.0),
+        (p::HEIGHT, 60.0),
+        (p::RADIUS, 5.0),
+        (p::BG_COLOR, 0xff201000u32 as f64),
+        (p::OVERFLOW, spec::Overflow::Hidden as u8 as f64),
+    ] {
+        ui.set_prop(panel, prop, value);
+    }
+    let mut cards = Vec::new();
+    let mut labels = Vec::new();
+    for i in 0..3 {
+        let card = ui.create_node(spec::NodeType::View as u8);
+        ui.insert_before(panel, card, 0);
+        for (prop, value) in [
+            (p::POS_TYPE, spec::PosType::Absolute as u8 as f64),
+            (p::INSET_L, 5.0 + i as f64 * 19.0),
+            (p::INSET_T, 7.0),
+            (p::WIDTH, 40.0),
+            (p::HEIGHT, 30.0),
+            (p::RADIUS, 4.0),
+            (p::BG_COLOR, (0x80403020u32 + i * 0x1020) as f64),
+        ] {
+            ui.set_prop(card, prop, value);
+        }
+        let text = ui.create_node(spec::NodeType::Text as u8);
+        ui.set_text(text, "AB");
+        ui.insert_before(card, text, 0);
+        cards.push(card);
+        labels.push(text);
+    }
+    for step in 0..72 {
+        match step % 12 {
+            0 => ui.set_text(labels[0], if step % 24 == 0 { "A" } else { "ABA" }),
+            1 => ui.set_prop(cards[1], p::TRANSLATE_X, (step % 7) as f64 * 1.3),
+            2 => ui.set_prop(panel, p::OPACITY, if step % 24 == 2 { 0.6 } else { 1.0 }),
+            3 => ui.set_prop(panel, p::WIDTH, 50.5 + (step % 30) as f64),
+            4 => ui.insert_before(panel, cards[2], cards[0]),
+            5 => ui.set_prop(cards[0], p::ROTATE, (step % 5) as f64 * 8.0),
+            6 => ui.set_prop(cards[2], p::DISPLAY, spec::Display::None as u8 as f64),
+            7 => ui.set_prop(cards[2], p::DISPLAY, spec::Display::Flex as u8 as f64),
+            8 => {
+                ui.destroy_node(labels[1]);
+                labels[1] = ui.create_node(spec::NodeType::Text as u8);
+                ui.set_text(labels[1], "BA");
+                ui.insert_before(cards[1], labels[1], 0);
+            }
+            9 => assert!(ui.load_font_atlas(&encode_atlas(
+                0,
+                8,
+                8,
+                7,
+                10,
+                2,
+                &[('A' as u32, 0, 4 + (step % 3) as u8), ('B' as u32, 1, 7)]
+            ))),
+            10 => ui.set_prop(labels[2], p::TEXT_COLOR, 0xffaabbccu32 as f64),
+            _ => ui.set_viewport(100.0 + (step % 4) as f32, 80.0),
+        }
+        ui.tick();
+        let actual = ui.draw().words.clone();
+        assert_eq!(ui.draw().words, actual, "unchanged step {step}");
+        assert_eq!(ui.draw_uncached().words, actual, "fresh walk step {step}");
+    }
+    ui.set_text(labels[0], "AZ");
+    ui.tick();
+    let first = ui.glyph_misses();
+    ui.draw();
+    let second = ui.glyph_misses();
+    ui.draw();
+    assert_eq!(second - first, ui.glyph_misses() - second);
+    assert!(second > first);
+}
+
+#[test]
+fn cached_groups_follow_fixed_text_focus_tweens_and_mask_replacement() {
+    use spec::prop as p;
+    let mut ui = Ui::new();
+    ui.set_draw_cache_enabled(true);
+    ui.set_viewport(120.0, 80.0);
+    assert!(ui.load_font_atlas(&encode_atlas(
+        0,
+        8,
+        8,
+        7,
+        10,
+        2,
+        &[('A' as u32, 0, 6), ('B' as u32, 1, 5)]
+    )));
+    let mut style = StyleSpec::new();
+    style.base = vec![
+        (p::WIDTH, 80f32.to_bits()),
+        (p::HEIGHT, 40f32.to_bits()),
+        (p::RADIUS, 8f32.to_bits()),
+        (p::BG_COLOR, 0xff302010),
+    ];
+    style.focus = vec![(p::BG_COLOR, 0xff00cc22)];
+    style.active = vec![(p::BG_COLOR, 0xffcc2200)];
+    assert!(ui.load_styles(&encode_styles(&[style])));
+    let panel = ui.create_node(spec::NodeType::View as u8);
+    ui.set_style(panel, 0);
+    ui.insert_before(spec::ROOT_ID, panel, 0);
+    let text = ui.create_node(spec::NodeType::Text as u8);
+    ui.set_prop(text, p::WIDTH, 40.0);
+    ui.set_prop(text, p::HEIGHT, 12.0);
+    ui.set_text(text, "A");
+    ui.insert_before(panel, text, 0);
+    fn compare(ui: &mut Ui) {
+        let words = ui.draw().words.clone();
+        assert_eq!(ui.draw().words, words);
+        assert_eq!(ui.draw_uncached().words, words);
+    }
+    ui.tick();
+    compare(&mut ui);
+    ui.set_text(text, "B");
+    assert!(!ui.layout.needs());
+    compare(&mut ui);
+    ui.set_focus(panel);
+    ui.tick();
+    compare(&mut ui);
+    ui.set_active(panel, true);
+    ui.tick();
+    compare(&mut ui);
+    let tween = ui.animate(
+        panel,
+        p::TRANSLATE_X,
+        12.0,
+        200,
+        spec::Easing::Linear as u8,
+        0,
+    );
+    for _ in 0..6 {
+        ui.tick();
+        compare(&mut ui);
+    }
+    ui.cancel_anim(tween);
+    compare(&mut ui);
+    let words = ui.draw().words.clone();
+    let mask = pocket_render::DrawOps::new(&words, pocket_drivers::DamageRect::new(0, 0, 120, 80))
+        .filter_map(Result::ok)
+        .find(|op| op.opcode == spec::draw_op::TEX_QUAD)
+        .unwrap()
+        .words[1] as i32;
+    ui.free_texture(mask);
+    compare(&mut ui);
+    assert!(ui.texture(mask).is_none());
+}

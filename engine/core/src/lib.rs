@@ -49,6 +49,7 @@ pub mod anim;
 #[cfg(feature = "counters")]
 pub mod counters;
 pub mod draw;
+mod draw_cache;
 pub mod fmath;
 pub mod layout;
 mod physics;
@@ -577,6 +578,7 @@ impl Ui {
     }
 
     fn bump_raster_revision(&mut self) {
+        self.paint_cache.invalidate_draw_cache();
         self.raster_revision = self.raster_revision.wrapping_add(1);
         self.resource_revision = self.resource_revision.wrapping_add(1);
     }
@@ -686,6 +688,7 @@ impl Ui {
     }
 
     fn mark_layout_style(&mut self, slot: u32) {
+        self.tree.mark_paint(slot);
         match self.tree.slots[slot as usize].layout_mode {
             tree::LAYOUT_STATIC => return,
             tree::LAYOUT_FORMULA => {
@@ -747,6 +750,16 @@ impl Ui {
         self.mark_structure_owner(owner);
     }
 
+    /// Use local geometry for eligible absolute leaves; other nodes retain Taffy layout.
+    pub fn set_fast_absolute_layout(&mut self, enabled: bool) {
+        self.layout.fast_absolute = enabled;
+        self.layout.mark_structure();
+        if let Some(auxiliary) = self.auxiliary.as_mut() {
+            auxiliary.layout.fast_absolute = enabled;
+            auxiliary.layout.mark_structure();
+        }
+    }
+
     /// Set how `id`'s rect is produced (tree::LAYOUT_LIVE, LAYOUT_STATIC or
     /// LAYOUT_FORMULA). A static node takes the given rect, relative to its
     /// parent, and its subtree leaves every solver projection; a formula node
@@ -763,6 +776,7 @@ impl Ui {
             return;
         }
         let was_live = self.tree.slots[slot as usize].layout_mode == tree::LAYOUT_LIVE;
+        self.tree.mark_paint(slot);
         self.tree.slots[slot as usize].layout_mode = mode;
         match mode {
             tree::LAYOUT_STATIC => {
@@ -790,6 +804,7 @@ impl Ui {
     /// Recompute a formula node's rect from its resolved style and its
     /// parent's rect.
     fn formula_layout(&mut self, slot: u32) {
+        self.tree.mark_paint(slot);
         let parent = self.tree.slots[slot as usize].parent;
         let (parent_size, origin) = match self.tree.resolve(parent) {
             Some(parent_slot) => {
@@ -864,6 +879,7 @@ impl Ui {
             );
         }
         let mut surface_layout = layout::LayoutEngine::new();
+        surface_layout.fast_absolute = self.layout.fast_absolute;
         surface_layout.viewport = (width, height);
         surface_layout.set_other_output_root(spec::ROOT_ID);
         self.layout.set_other_output_root(root);
@@ -1070,6 +1086,8 @@ impl Ui {
                 self.refresh_region(slot);
             }
             self.mark_layout_style(slot);
+        } else {
+            self.tree.mark_paint(slot);
         }
     }
 
@@ -1090,6 +1108,7 @@ impl Ui {
         // branch re-collects the run and re-shapes ONCE). Only an empty <->
         // non-empty flip is structural: empty runs are excluded from the
         // taffy tree entirely, so the leaf has to (dis)appear.
+        self.tree.mark_paint(slot);
         let root_slot = self.text_layout_root(slot);
         if self.tree.slots[root_slot as usize].layout_mode != tree::LAYOUT_LIVE {
             // An externally placed cell: the run never sizes the box.
@@ -1828,6 +1847,7 @@ impl Ui {
         let Some(slot) = self.tree.resolve(id) else {
             return -1;
         };
+        self.tree.mark_paint(slot);
         let kind = spec::PROP_VALUE_KIND[prop as usize];
         let is_color = kind == spec::value_kind::COLOR;
         let from = style::resolve_animated(&self.tree.slots[slot as usize], &self.styles, true)
@@ -1894,6 +1914,7 @@ impl Ui {
             (t.node, t.prop)
         };
         if let Some(slot) = self.tree.resolve(node_id) {
+            self.tree.mark_paint(slot);
             let node = &mut self.tree.slots[slot as usize];
             if let Some(cur) = tree::Node::find_entry(&node.anim_values, prop) {
                 tree::Node::put_entry(&mut node.overrides, prop, cur);
@@ -2166,6 +2187,8 @@ impl Ui {
             }
             if spec::is_layout_dirtying(prop) {
                 self.mark_layout_style(slot);
+            } else {
+                self.tree.mark_paint(slot);
             }
         }
         self.anims.publish_completions();
@@ -2188,6 +2211,7 @@ impl Ui {
             }
             let aux_root = self.auxiliary.as_ref().map_or(0, |auxiliary| auxiliary.root);
             physics.step(self.dt, &mut self.tree, aux_root);
+            self.paint_cache.invalidate_draw_cache();
         }
         if self.layout.needs() {
             layout::relayout(&mut self.tree, &self.styles, &self.fonts, &mut self.layout);
@@ -2351,6 +2375,7 @@ impl Ui {
                 }
             }
             let mut layout_changed = false;
+            let mut paint_changed = false;
             {
                 let node = &mut self.tree.slots[slot as usize];
                 for &(prop, value) in &writes {
@@ -2360,12 +2385,14 @@ impl Ui {
                             if prev != Some(bits) {
                                 tree::Node::put_entry(&mut node.anim_values, prop, bits);
                                 layout_changed |= spec::is_layout_dirtying(prop);
+                                paint_changed = true;
                             }
                         }
                         None => {
                             if prev.is_some() {
                                 tree::Node::remove_entry(&mut node.anim_values, prop);
                                 layout_changed |= spec::is_layout_dirtying(prop);
+                                paint_changed = true;
                             }
                         }
                     }
@@ -2373,6 +2400,8 @@ impl Ui {
             }
             if layout_changed {
                 self.mark_layout_style(slot);
+            } else if paint_changed {
+                self.tree.mark_paint(slot);
             }
             i = end;
         }
@@ -2429,9 +2458,35 @@ impl Ui {
         }
     }
 
+    /// Reuse commands of unchanged small view subtrees. Baked fonts use this
+    /// path; native/streamed text and external image content keep the full walk.
+    pub fn set_draw_cache_enabled(&mut self, enabled: bool) {
+        if self.tree.paint_tracking != enabled {
+            self.paint_cache.invalidate_draw_cache();
+        }
+        self.tree.paint_tracking = enabled;
+        self.paint_cache.set_draw_cache_enabled(enabled);
+    }
+
+    /// Enabled, active, stored command groups, and successful replays.
+    pub fn draw_cache_info(&self) -> (bool, bool, usize, u32) {
+        self.paint_cache.draw_cache_info()
+    }
+
+    #[cfg(not(target_os = "none"))]
+    pub fn draw_uncached(&mut self) -> &DrawList {
+        let enabled = self.tree.paint_tracking;
+        self.paint_cache.set_draw_cache_enabled(false);
+        self.draw();
+        self.paint_cache.set_draw_cache_enabled(enabled);
+        &self.draw_list
+    }
+
     /// Walk the tree into the DrawList (spec.ts DRAWLIST format) and return
     /// it. Output is valid until the next mutating call.
     pub fn draw(&mut self) -> &DrawList {
+        self.paint_cache
+            .set_external_draw_state(self.physics.is_some());
         self.evict_textures();
         self.draw_list.stable_motion_paint = self.stable_motion_paint;
         self.fonts.stream_begin(self.frame);
@@ -2529,6 +2584,8 @@ impl Ui {
     /// Build the auxiliary output DrawList for the current frame. Returns
     /// None until the host creates the auxiliary surface before guest mount.
     pub fn draw_auxiliary(&mut self) -> Option<&DrawList> {
+        self.paint_cache
+            .set_external_draw_state(self.physics.is_some());
         let auxiliary = self.auxiliary.as_mut()?;
         if auxiliary.layout.needs() {
             layout::relayout_root(

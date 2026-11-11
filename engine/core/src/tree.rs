@@ -178,6 +178,10 @@ impl Node {
 pub struct Tree {
     pub slots: Vec<Node>,
     free: Vec<u32>,
+    pub(crate) paint_tracking: bool,
+    pub(crate) structure_revision: u64,
+    paint_clock: u64,
+    paint_versions: Vec<u64>,
 }
 
 impl Tree {
@@ -185,7 +189,14 @@ impl Tree {
     /// full-screen flex column (via dynamic overrides so any user style still
     /// layers under them predictably).
     pub fn new() -> Tree {
-        let mut t = Tree { slots: Vec::new(), free: Vec::new() };
+        let mut t = Tree {
+            slots: Vec::new(),
+            free: Vec::new(),
+            paint_tracking: false,
+            structure_revision: 1,
+            paint_clock: 1,
+            paint_versions: alloc::vec![0, 1],
+        };
         t.slots.push(Node::empty(0)); // slot 0: never allocated
         let mut root = Node::empty(0);
         root.node_type = spec::NodeType::View as u8;
@@ -195,6 +206,22 @@ impl Tree {
         root.overrides.push((spec::prop::FLEX_DIR, spec::FlexDir::Col as u32));
         t.slots.push(root); // slot 1 == spec::ROOT_ID (gen 0)
         t
+    }
+
+    pub(crate) fn paint_revision(&self, slot: u32) -> u64 {
+        self.paint_versions[slot as usize]
+    }
+
+    pub(crate) fn mark_paint(&mut self, slot: u32) {
+        if !self.paint_tracking {
+            return;
+        }
+        self.paint_clock = self.paint_clock.wrapping_add(1);
+        let mut current = Some(slot);
+        while let Some(index) = current {
+            self.paint_versions[index as usize] = self.paint_clock;
+            current = self.resolve(self.slots[index as usize].parent);
+        }
     }
 
     /// Resolve an id to its arena slot; `None` for 0, stale or dead ids.
@@ -219,6 +246,7 @@ impl Tree {
     #[inline]
     pub fn get_mut(&mut self, id: i32) -> Option<&mut Node> {
         let s = self.resolve(id)?;
+        self.mark_paint(s);
         Some(&mut self.slots[s as usize])
     }
 
@@ -231,6 +259,7 @@ impl Tree {
                     return 0;
                 }
                 self.slots.push(Node::empty(0));
+                self.paint_versions.push(0);
                 (self.slots.len() - 1) as u32
             }
         };
@@ -239,11 +268,15 @@ impl Tree {
         *node = Node::empty(generation);
         node.node_type = node_type;
         node.alive = true;
+        self.structure_revision = self.structure_revision.wrapping_add(1);
+        self.mark_paint(slot);
         make_id(generation, slot)
     }
 
     /// Free one slot (bump generation so outstanding ids go stale).
     pub fn free_slot(&mut self, slot: u32) {
+        self.mark_paint(slot);
+        self.structure_revision = self.structure_revision.wrapping_add(1);
         let node = &mut self.slots[slot as usize];
         let next_gen = (node.generation + 1) & GEN_MASK;
         *node = Node::empty(next_gen);
@@ -257,8 +290,10 @@ impl Tree {
         if parent_id != 0 {
             if let Some(pslot) = self.resolve(parent_id) {
                 self.slots[pslot as usize].children.retain(|&c| c != child_id);
+                self.mark_paint(pslot);
             }
             self.slots[cslot as usize].parent = 0;
+            self.structure_revision = self.structure_revision.wrapping_add(1);
         }
     }
 
@@ -324,6 +359,8 @@ impl Tree {
         }
         if let Some(cslot) = self.resolve(child_id) {
             self.slots[cslot as usize].parent = parent_id;
+            self.mark_paint(cslot);
+            self.structure_revision = self.structure_revision.wrapping_add(1);
         }
         true
     }

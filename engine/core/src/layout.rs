@@ -110,6 +110,158 @@ fn float_key(value: f32) -> u32 {
     }
 }
 
+struct AbsoluteLeaf {
+    id: i32,
+    active: bool,
+    width: f32,
+    height: f32,
+    inset: [f32; 4],
+    hidden: bool,
+    measure: Option<MeasureCtx>,
+    parent_size: (f32, f32),
+    origin: (f32, f32),
+    parent_hidden: bool,
+    unrounded: (f32, f32, f32, f32),
+}
+
+fn absolute_leaf_supported(node: &crate::tree::Node, r: &Resolved, fonts: &Fonts) -> bool {
+    let text = node.node_type == spec::NodeType::Text as u8;
+    let pixels = |v: f32| v.is_finite() && (0.0..=32000.0).contains(&v);
+    node.layout_mode == LAYOUT_LIVE
+        && !node.region_root
+        && (text || node.children.is_empty())
+        && r.pos_type == spec::PosType::Absolute as u8
+        && (pixels(r.width) || (text && r.width.is_nan()))
+        && (pixels(r.height) || (text && r.height.is_nan()))
+        && r.padding == [0.0; 4]
+        && r.margin == [0.0; 4]
+        && [r.min_w, r.min_h, r.max_w, r.max_h]
+            .iter()
+            .all(|v| v.is_nan())
+        && r.inset
+            .iter()
+            .all(|v| v.is_nan() || (v.is_finite() && v.abs() <= 32000.0))
+        && (r.inset[3].is_finite() || r.inset[1].is_finite())
+        && (r.inset[0].is_finite() || r.inset[2].is_finite())
+        && (!text
+            || (r.tracking == 0.0
+                && (r.line_height.is_nan() || pixels(r.line_height))
+                && !fonts.native_active()
+                && fonts
+                    .atlas(r.font_slot as u8)
+                    .is_none_or(|a| a.stream.is_none())))
+}
+
+fn update_absolute(
+    tree: &mut Tree,
+    fonts: &Fonts,
+    eng: &mut LayoutEngine,
+    slot: u32,
+    r: &Resolved,
+    run: String,
+    replay: bool,
+) {
+    let id = tree.slots[slot as usize].id(slot);
+    if !eng.absolute[slot as usize]
+        .as_ref()
+        .is_some_and(|item| item.id == id)
+    {
+        eng.absolute[slot as usize] = Some(AbsoluteLeaf {
+            id,
+            active: true,
+            width: r.width,
+            height: r.height,
+            inset: r.inset,
+            hidden: r.display == spec::Display::None as u8,
+            measure: None,
+            parent_size: (0.0, 0.0),
+            origin: (0.0, 0.0),
+            parent_hidden: false,
+            unrounded: (0.0, 0.0, 0.0, 0.0),
+        });
+    }
+    let item = eng.absolute[slot as usize].as_mut().unwrap();
+    item.active = true;
+    item.width = r.width;
+    item.height = r.height;
+    item.inset = r.inset;
+    item.hidden = r.display == spec::Display::None as u8;
+    if tree.slots[slot as usize].node_type == spec::NodeType::Text as u8 {
+        if let Some(ctx) = item.measure.as_ref().filter(|ctx| {
+            ctx.environment_epoch == eng.environment_epoch
+                && ctx.matches(&run, r.font_slot as u8, r.tracking, r.line_height, false)
+        }) {
+            if replay {
+                ctx.replay_misses(fonts);
+            }
+        } else {
+            let mut ctx = MeasureCtx::shaped(
+                fonts,
+                run,
+                r.font_slot as u8,
+                r.tracking,
+                r.line_height,
+                false,
+            );
+            ctx.environment_epoch = eng.environment_epoch;
+            item.measure = Some(ctx);
+            #[cfg(feature = "counters")]
+            {
+                eng.counters.shaping_calls = eng.counters.shaping_calls.saturating_add(1);
+            }
+        }
+    }
+    tree.slots[slot as usize].taffy = None;
+    tree.slots[slot as usize].text_native = false;
+}
+
+fn place_absolute(tree: &mut Tree, slot: u32, item: &mut AbsoluteLeaf) {
+    let rect = if item.hidden || item.parent_hidden {
+        item.unrounded = (0.0, 0.0, 0.0, 0.0);
+        LayoutRect::default()
+    } else {
+        let measured = item.measure.as_ref().map_or((0.0, 0.0), |ctx| ctx.size);
+        let axis = |size: f32, start: f32, end: f32, parent: f32, measured: f32| {
+            let size = if size.is_nan() {
+                if start.is_finite() && end.is_finite() {
+                    (parent - start - end).max(0.0)
+                } else {
+                    measured.max(0.0)
+                }
+            } else {
+                size.max(0.0)
+            };
+            // Preserve the solver's arithmetic order for fractional offsets.
+            let position = if start.is_finite() {
+                start + 0.0
+            } else {
+                parent - size - end - 0.0
+            };
+            (position, size)
+        };
+        let (x, w) = axis(
+            item.width,
+            item.inset[3],
+            item.inset[1],
+            item.parent_size.0,
+            measured.0,
+        );
+        let (y, h) = axis(
+            item.height,
+            item.inset[0],
+            item.inset[2],
+            item.parent_size.1,
+            measured.1,
+        );
+        item.unrounded = (x, y, w, h);
+        rounded_rect((x, y), (w, h), item.origin).0
+    };
+    if tree.slots[slot as usize].layout != rect {
+        tree.slots[slot as usize].layout = rect;
+        tree.mark_paint(slot);
+    }
+}
+
 #[derive(Clone, Copy)]
 struct LayoutEntry {
     /// Includes the arena generation: a reused slot is a different node.
@@ -149,6 +301,8 @@ pub struct Region {
 /// and the dirty flags.
 pub struct LayoutEngine {
     pub taffy: TaffyTree<MeasureCtx>,
+    pub(crate) fast_absolute: bool,
+    absolute: Vec<Option<AbsoluteLeaf>>,
     /// Reconcile the projected structure and resolved styles before solving.
     pub dirty: bool,
     /// STYLE dirty slots: nodes whose resolved style changed but whose place
@@ -229,6 +383,7 @@ impl LayoutEngine {
     #[cfg(feature = "counters")]
     pub fn force_rebuild_for_validation(&mut self) {
         self.taffy = new_taffy();
+        self.absolute.clear();
         self.entries.clear();
         self.style_dirty.clear();
         for region in &mut self.regions {
@@ -308,6 +463,8 @@ impl LayoutEngine {
     pub fn new() -> LayoutEngine {
         LayoutEngine {
             taffy: new_taffy(),
+            fast_absolute: false,
+            absolute: Vec::new(),
             dirty: true,
             style_dirty: Vec::new(),
             regions: Vec::new(),
@@ -698,6 +855,16 @@ fn update_measure(
     {
         eng.counters.shaping_calls = eng.counters.shaping_calls.saturating_add(1);
     }
+    if let Some(old) = eng.taffy.get_node_context_mut(handle) {
+        if old.size.0.to_bits() == context.size.0.to_bits()
+            && old.size.1.to_bits() == context.size.1.to_bits()
+            && old.native == context.native
+        {
+            // The measure callback only exposes size; keep its existing solver cache.
+            *old = context;
+            return;
+        }
+    }
     let _ = eng.taffy.set_node_context(handle, Some(context));
 }
 
@@ -751,6 +918,7 @@ fn sync_node(
     fonts: &Fonts,
     eng: &mut LayoutEngine,
     slot: u32,
+    root_id: i32,
     in_transform: bool,
     replay_all_misses: bool,
     style_dirty: &[u32],
@@ -769,6 +937,26 @@ fn sync_node(
             return None;
         }
     }
+    if eng.fast_absolute
+        && eng.regions.is_empty()
+        && tree.slots[slot as usize].id(slot) != root_id
+        && absolute_leaf_supported(&tree.slots[slot as usize], &resolved, fonts)
+    {
+        if let Some(old) = entry(eng, tree, slot) {
+            retire_entry(eng, slot as usize, old);
+        }
+        update_absolute(
+            tree,
+            fonts,
+            eng,
+            slot,
+            &resolved,
+            run,
+            replay_all_misses || style_dirty.binary_search(&slot).is_ok(),
+        );
+        return None;
+    }
+    eng.absolute[slot as usize] = None;
     let native = is_text && fonts.native_active() && resolved.tracking == 0.0 && !in_transform;
     let old = entry(eng, tree, slot);
     let handle = if let Some(old) = old {
@@ -839,6 +1027,7 @@ fn sync_node(
                     fonts,
                     eng,
                     child_slot,
+                    root_id,
                     in_transform,
                     replay_all_misses,
                     style_dirty,
@@ -908,12 +1097,17 @@ fn assign_rect(
         None => (LayoutRect::default(), cum, (0.0, 0.0)),
     };
     let node = &mut tree.slots[slot as usize];
+    let changed = node.layout != rect;
+    let native_before = node.text_native;
     node.taffy = handle;
     node.layout = rect;
     if node.node_type == spec::NodeType::Text as u8 {
         node.text_native = handle
             .and_then(|handle| eng.taffy.get_node_context(handle))
             .is_some_and(|context| context.native);
+    }
+    if changed || native_before != node.text_native {
+        tree.mark_paint(slot);
     }
     (child_cum, size)
 }
@@ -928,18 +1122,47 @@ fn readback_scope(
     slot: u32,
     assign_root: bool,
     cum: (f32, f32),
+    inherited_hidden: bool,
 ) {
     let cum = if assign_root {
         assign_rect(tree, eng, slot, cum).0
     } else {
         cum
     };
+    let handle = entry(eng, tree, slot)
+        .filter(|item| item.active)
+        .map(|item| item.handle);
+    let size = handle
+        .map(|handle| eng.taffy.unrounded_layout(handle).size)
+        .map_or(
+            (
+                tree.slots[slot as usize].layout.w,
+                tree.slots[slot as usize].layout.h,
+            ),
+            |size| (size.width, size.height),
+        );
+    let hidden = inherited_hidden
+        || handle.is_some_and(|handle| {
+            eng.taffy
+                .style(handle)
+                .is_ok_and(|style| style.display == taffy::Display::None)
+        });
     let children = tree.slots[slot as usize].children.clone();
     for child in children {
         let Some(child_slot) = tree.resolve(child) else {
             continue;
         };
         if tree.slots[child_slot as usize].layout_mode != LAYOUT_LIVE {
+            continue;
+        }
+        if let Some(item) = eng.absolute.get_mut(child_slot as usize).and_then(Option::as_mut).filter(|item| item.active && item.id == child) {
+            item.parent_size = size;
+            item.origin = cum;
+            item.parent_hidden = hidden;
+            place_absolute(tree, child_slot, item);
+            let child_cum = (cum.0 + item.unrounded.0, cum.1 + item.unrounded.1);
+            let child_hidden = hidden || item.hidden;
+            readback_scope(tree, eng, child_slot, false, child_cum, child_hidden);
             continue;
         }
         let (child_cum, size) = assign_rect(tree, eng, child_slot, cum);
@@ -950,7 +1173,7 @@ fn readback_scope(
             }
             continue;
         }
-        readback_scope(tree, eng, child_slot, false, child_cum);
+        readback_scope(tree, eng, child_slot, false, child_cum, hidden);
     }
 }
 
@@ -1000,7 +1223,7 @@ fn compute(tree: &mut Tree, eng: &mut LayoutEngine, root_slot: u32, root_nid: ta
     eng.solved_viewport = Some((eng.viewport.0.to_bits(), eng.viewport.1.to_bits()));
     // Rounding is cumulative: a cached child's pixel rounding can change when
     // an ancestor moves, so every owned node reads back.
-    readback_scope(tree, eng, root_slot, true, (0.0, 0.0));
+    readback_scope(tree, eng, root_slot, true, (0.0, 0.0), false);
     eng.root_read = true;
 }
 
@@ -1031,6 +1254,7 @@ pub fn relayout_root(
     let mut dirty = core::mem::take(&mut eng.style_dirty);
     let replay_all_misses = eng.dirty || !eng.built;
     eng.entries.resize(tree.slots.len(), None);
+    eng.absolute.resize_with(tree.slots.len(), || None);
     // Regions whose root node is gone release their solver root.
     let mut index = 0;
     while index < eng.regions.len() {
@@ -1053,7 +1277,22 @@ pub fn relayout_root(
             })
         })
     };
-    let full = eng.dirty
+    let absolute_changed = eng.fast_absolute
+        && eng.regions.is_empty()
+        && dirty.iter().any(|&slot| {
+            let node = &tree.slots[slot as usize];
+            if node.id(slot) == root_id {
+                return false;
+            }
+            let fast = eng.absolute[slot as usize]
+                .as_ref()
+                .is_some_and(|item| item.id == node.id(slot) && item.active);
+            if !fast && !entry(eng, tree, slot).is_some_and(|item| item.active) {
+                return false;
+            }
+            fast != absolute_leaf_supported(node, &style::resolve(node, styles, true), fonts)
+        });
+    let full = eng.dirty || absolute_changed
         || !eng.built
         || transform_changed(&dirty, eng)
         || eng
@@ -1074,9 +1313,8 @@ pub fn relayout_root(
         dirty.sort_unstable();
         dirty.dedup();
         retire_dead(tree, eng);
-        for item in eng.entries.iter_mut().flatten() {
-            item.active = false;
-        }
+        for item in eng.entries.iter_mut().flatten() { item.active = false; }
+        for item in eng.absolute.iter_mut().flatten() { item.active = false; }
         eng.root = tree.resolve(root_id).and_then(|slot| {
             sync_node(
                 tree,
@@ -1084,6 +1322,7 @@ pub fn relayout_root(
                 fonts,
                 eng,
                 slot,
+                root_id,
                 false,
                 replay_all_misses,
                 &dirty,
@@ -1093,6 +1332,9 @@ pub fn relayout_root(
             sync_region(tree, styles, fonts, eng, index, root_id, replay_all_misses, &dirty);
         }
         retire_unprojected(tree, eng, root_id);
+        for item in &mut eng.absolute {
+            if item.as_ref().is_some_and(|item| !item.active) { *item = None; }
+        }
         if let Some(handle) = eng.root {
             if let Some(parent) = eng.taffy.parent(handle) {
                 let _ = eng.taffy.remove_child(parent, handle);
@@ -1149,12 +1391,12 @@ pub fn relayout_root(
                 {
                     compute(tree, eng, root_slot, root);
                 } else if !eng.root_read {
-                    readback_scope(tree, eng, root_slot, true, (0.0, 0.0));
+                    readback_scope(tree, eng, root_slot, true, (0.0, 0.0), false);
                     eng.root_read = true;
                 }
             }
             None => {
-                readback_scope(tree, eng, root_slot, true, (0.0, 0.0));
+                readback_scope(tree, eng, root_slot, true, (0.0, 0.0), false);
                 eng.root_read = false;
             }
         }
@@ -1172,6 +1414,15 @@ fn restyle(
     dirty: &[u32],
 ) {
     for &slot in dirty {
+        if eng.absolute[slot as usize].as_ref().is_some_and(|item| item.active && item.id == tree.slots[slot as usize].id(slot)) {
+            let resolved = style::resolve(&tree.slots[slot as usize], styles, true);
+            let mut run = String::new();
+            if tree.slots[slot as usize].node_type == spec::NodeType::Text as u8 { tree.collect_run(slot, &mut run); }
+            update_absolute(tree, fonts, eng, slot, &resolved, run, true);
+            place_absolute(tree, slot, eng.absolute[slot as usize].as_mut().unwrap());
+            continue;
+        }
+
         let Some(old) = entry(eng, tree, slot).filter(|entry| entry.active) else {
             continue;
         };
@@ -1266,6 +1517,7 @@ fn sync_region(
                 fonts,
                 eng,
                 child_slot,
+                root_id,
                 in_transform,
                 replay_all_misses,
                 style_dirty,
@@ -1350,7 +1602,7 @@ fn solve_regions(tree: &mut Tree, eng: &mut LayoutEngine) {
             }
             eng.regions[index].solved_box = Some(key);
         }
-        readback_scope(tree, eng, slot, false, origin);
+        readback_scope(tree, eng, slot, false, origin, false);
         eng.regions[index].read_origin = Some(origin_bits);
     }
 }
@@ -1388,6 +1640,14 @@ fn depth(tree: &Tree, id: i32) -> usize {
 /// Unrounded solver output of a live node: (x, y, w, h) relative to its
 /// parent, or None for nodes without a solver node.
 pub fn unrounded_of(eng: &LayoutEngine, tree: &Tree, slot: u32) -> Option<(f32, f32, f32, f32)> {
+    if let Some(item) = eng
+        .absolute
+        .get(slot as usize)
+        .and_then(Option::as_ref)
+        .filter(|item| item.active && item.id == tree.slots[slot as usize].id(slot))
+    {
+        return Some(item.unrounded);
+    }
     let entry = entry(eng, tree, slot).filter(|entry| entry.active)?;
     let layout = eng.taffy.unrounded_layout(entry.handle);
     Some((layout.location.x, layout.location.y, layout.size.width, layout.size.height))

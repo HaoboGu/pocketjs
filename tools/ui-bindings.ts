@@ -18,10 +18,14 @@ function rust(): string {
   out += `pub const OP_DESCRIPTORS: &[OpDescriptor] = &[\n`;
   for (const op of numbered) out += `    OpDescriptor { id: ${op.id}, name: "${op.name}", args: &[${op.args.map(a => `ArgDescriptor { name: "${a.name}", kind: ArgKind::${variant(a.kind)}, optional: ${!!a.optional} }`).join(", ")}], result: ResultKind::${variant(op.result)}, provider: "${op.provider}", capability: ${op.capability ? `Some("${op.capability}")` : "None"} },\n`;
   out += `];\npub const IDF_OPS: &[u16] = &${JSON.stringify(UI_IDF_OPS)};\n`;
-  out += `pub fn descriptor(op: u16) -> Option<&'static OpDescriptor> { OP_DESCRIPTORS.iter().find(|entry| entry.id == op) }\n`;
+  if (numbered.every((op, index) => op.id === index + 1)) {
+    out += `pub fn descriptor(op: u16) -> Option<&'static OpDescriptor> { OP_DESCRIPTORS.get(op.checked_sub(1)? as usize) }\n`;
+  } else {
+    out += `pub fn descriptor(op: u16) -> Option<&'static OpDescriptor> { OP_DESCRIPTORS.iter().find(|entry| entry.id == op) }\n`;
+  }
   out += `pub fn supports_core_op(op: u16) -> bool { matches!(op, ${numbered.filter(op => op.core).map(op=>op.id).join(" | ")}) }\n`;
   out += `pub fn validate_args(op: u16, args: &[OpArg<'_>]) -> Result<(), RuntimeError> {\n    let descriptor = descriptor(op).ok_or(RuntimeError::UnsupportedOperation)?;\n    if args.len() != descriptor.args.len() { return Err(RuntimeError::InvalidArgument); }\n    for (arg, expected) in args.iter().zip(descriptor.args) {\n        let valid = match (arg, expected.kind) {\n            (OpArg::Integer(_), ArgKind::I32 | ArgKind::U32 | ArgKind::Nonnegative | ArgKind::Boolean) => true,\n            (OpArg::Real(_), ArgKind::Real) => true,\n            (OpArg::Bytes(bytes), ArgKind::String) => core::str::from_utf8(bytes).is_ok(),\n            (OpArg::Bytes(_), ArgKind::Bytes) => true,\n            _ => false,\n        };\n        if !valid { return Err(RuntimeError::InvalidArgument); }\n    }\n    Ok(())\n}\n`;
-  out += `pub fn dispatch(ui: &mut Ui, op: u16, args: &[OpArg<'_>]) -> Result<OpResult, RuntimeError> {\n    validate_args(op, args)?;\n    match op {\n`;
+  out += `pub fn dispatch(ui: &mut Ui, op: u16, args: &[OpArg<'_>]) -> Result<OpResult, RuntimeError> {\n    validate_args(op, args)?;\n    dispatch_validated(ui, op, args)\n}\n\npub(crate) fn dispatch_validated(ui: &mut Ui, op: u16, args: &[OpArg<'_>]) -> Result<OpResult, RuntimeError> {\n    match op {\n`;
   for (const op of numbered.filter(op => op.core)) {
     out += `        ${op.id} => { // ${op.name}\n`;
     op.args.forEach((arg, i) => {

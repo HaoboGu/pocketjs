@@ -466,6 +466,7 @@ pub struct PaintCache {
     glyphs: Vec<GlyphPage>,
     borders: Vec<([u32; 4], i32)>,
     layouts: BTreeMap<u32, CachedTextLayout>,
+    subtrees: crate::draw_cache::DrawCache,
 }
 
 // Node-indexed placement cache. Transforms and tint do not affect placement;
@@ -493,7 +494,22 @@ impl PaintCache {
             glyphs: Vec::new(),
             borders: Vec::new(),
             layouts: BTreeMap::new(),
+            subtrees: crate::draw_cache::DrawCache::new(),
         }
+    }
+
+    pub(crate) fn set_external_draw_state(&mut self, active: bool) {
+        self.subtrees.external_state = active;
+    }
+    pub(crate) fn set_draw_cache_enabled(&mut self, enabled: bool) {
+        self.subtrees.enabled = enabled;
+    }
+
+    pub(crate) fn draw_cache_info(&self) -> (bool, bool, usize, u32) {
+        self.subtrees.info()
+    }
+    pub(crate) fn invalidate_draw_cache(&mut self) {
+        self.subtrees.invalidate();
     }
 
     #[cfg(test)]
@@ -1192,6 +1208,15 @@ pub fn build_root(
     } else {
         u32::MAX
     };
+    let cache_allowed = inspect_id == 0
+        && dl.capture_texts == 0
+        && !fonts.native_active()
+        && (0..spec::MAX_FONT_SLOTS).all(|slot| {
+            fonts
+                .atlas(slot as u8)
+                .is_none_or(|atlas| atlas.stream.is_none())
+        });
+    paint_cache.subtrees.prepare(tree, cache_allowed);
     let mut w = Walker {
         tree,
         styles,
@@ -1306,6 +1331,57 @@ impl<'a> Walker<'a> {
         in_transform: bool,
         dl: &mut DrawList,
     ) {
+        let node = &self.tree.slots[slot as usize];
+        if self.paint_cache.subtrees.active()
+            && self.inspect_slot == u32::MAX
+            && self.texts.is_none()
+            && (node.node_type == spec::NodeType::Text as u8
+                || (node.node_type == spec::NodeType::View as u8 && !node.children.is_empty()))
+        {
+            let context = [
+                parent_world.a.to_bits(),
+                parent_world.b.to_bits(),
+                parent_world.c.to_bits(),
+                parent_world.d.to_bits(),
+                parent_world.tx.to_bits(),
+                parent_world.ty.to_bits(),
+                opacity.to_bits(),
+                clip.x0.to_bits(),
+                clip.y0.to_bits(),
+                clip.x1.to_bits(),
+                clip.y1.to_bits(),
+                u32::from(in_transform),
+                self.screen.0.to_bits(),
+                self.screen.1.to_bits(),
+                self.raster_density | (u32::from(dl.stable_motion_paint) << 16),
+            ];
+            if let Some(commands) =
+                self.paint_cache
+                    .subtrees
+                    .get(slot, self.tree.paint_revision(slot), context)
+            {
+                if commands
+                    .textures
+                    .iter()
+                    .all(|&handle| crate::touch_texture(self.textures, handle as u32, self.frame))
+                {
+                    dl.words.extend_from_slice(&commands.words);
+                    return;
+                }
+            }
+            let start = dl.words.len();
+            let misses = self.fonts.misses.get();
+            self.paint_node(slot, parent_world, opacity, clip, in_transform, dl);
+            if !self.provider_stale && self.fonts.misses.get() == misses {
+                self.paint_cache.subtrees.store(
+                    slot,
+                    self.tree.paint_revision(slot),
+                    context,
+                    &dl.words[start..],
+                );
+            }
+            return;
+        }
         // A text capture reads one subtree: the walk is inside it from its
         // root down.
         if slot == self.capture_slot && !self.capturing {

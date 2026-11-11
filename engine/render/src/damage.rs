@@ -280,6 +280,8 @@ pub struct DamageTracker<const MAX_REGIONS: usize = DEFAULT_DAMAGE_REGIONS> {
     pending_target: DamageTarget,
     pending_resource_revision: u64,
     pending: bool,
+    pending_rows: Vec<u32>,
+    pending_indexed: bool,
     /// Working storage of the motion planner, kept between frames.
     scratch: MotionScratch,
 }
@@ -307,6 +309,8 @@ impl<const MAX_REGIONS: usize> DamageTracker<MAX_REGIONS> {
             pending_target: DamageTarget::new(0, 0, 0, 0),
             pending_resource_revision: 0,
             pending: false,
+            pending_rows: Vec::new(),
+            pending_indexed: false,
             scratch: MotionScratch {
                 pairs: Vec::new(),
                 covers: Vec::new(),
@@ -383,9 +387,31 @@ impl<const MAX_REGIONS: usize> DamageTracker<MAX_REGIONS> {
         words: &[u32],
         target: DamageTarget,
     ) -> Result<DamagePlan<MAX_REGIONS>, DamageError> {
+        self.prepare_retained(ui, words, target, true)
+    }
+
+    /// Plan repaint regions while retaining decoded operations between frames.
+    /// No pixel-copy opportunities are searched; every changed region is repainted.
+    pub fn prepare_cached(
+        &mut self,
+        ui: &impl RenderResources,
+        words: &[u32],
+        target: DamageTarget,
+    ) -> Result<DamagePlan<MAX_REGIONS>, DamageError> {
+        self.prepare_retained(ui, words, target, false)
+    }
+
+    fn prepare_retained(
+        &mut self,
+        ui: &impl RenderResources,
+        words: &[u32],
+        target: DamageTarget,
+        allow_motion: bool,
+    ) -> Result<DamagePlan<MAX_REGIONS>, DamageError> {
         // An older decoded list is never committed after this call, including
         // when it returns early.
         self.pending = false;
+        self.pending_indexed = false;
         if MAX_REGIONS == 0 {
             return Err(DamageError::InvalidCapacity);
         }
@@ -414,6 +440,7 @@ impl<const MAX_REGIONS: usize> DamageTracker<MAX_REGIONS> {
                 &self.pending_ops,
                 screen,
                 &mut self.scratch,
+                allow_motion,
             );
             for op in &self.pending_ops {
                 if sampled_texture(op.code, &words[op.start..op.end])
@@ -429,7 +456,35 @@ impl<const MAX_REGIONS: usize> DamageTracker<MAX_REGIONS> {
         self.pending_target = target;
         self.pending_resource_revision = ui.resource_revision();
         self.pending = true;
+        if !allow_motion {
+            let stride = self.pending_ops.len().div_ceil(32);
+            self.pending_rows.resize(32 * stride, 0);
+            self.pending_rows.fill(0);
+            let height = screen.y1 as usize;
+            for (index, op) in self.pending_ops.iter().enumerate() {
+                if !painted(op) || op.bounds.is_empty() {
+                    continue;
+                }
+                let first = op.bounds.y0.max(0) as usize * 32 / height;
+                let last = (op.bounds.y1 as usize - 1) * 32 / height;
+                for row in first..=last.min(31) {
+                    self.pending_rows[row * stride + index / 32] |= 1 << (index % 32);
+                }
+            }
+            self.pending_indexed = true;
+        }
         Ok(plan)
+    }
+
+    /// Current validated commands and their clipped bounds, indexed by vertical bands.
+    /// Consume before committing or changing the render resources.
+    pub fn prepared_commands(&self) -> Option<PreparedDrawList<'_>> {
+        (self.pending && self.pending_indexed).then_some(PreparedDrawList {
+            words: &self.pending_words,
+            ops: &self.pending_ops,
+            rows: &self.pending_rows,
+            height: self.pending_target.height / self.pending_target.scale.max(1),
+        })
     }
 
     /// Record the DrawList after its [`DamagePlan`] has been rendered.
@@ -460,9 +515,12 @@ impl<const MAX_REGIONS: usize> DamageTracker<MAX_REGIONS> {
         self.valid = true;
         self.textures.clear();
         let Ok(screen) = target_screen(ui, target) else { return };
-        let mut decoder = DamageDecoder::new(&self.words, screen);
-        while let Ok(Some(op)) = decoder.next(ui) {
-            let Some(handle) = sampled_texture(op.code, op.words) else { continue };
+        // Texture tracking only needs operation headers, not glyph bounds.
+        for op in crate::DrawOps::new(&self.words, screen) {
+            let Ok(op) = op else { break };
+            let Some(handle) = sampled_texture(op.opcode, op.words) else {
+                continue;
+            };
             if self.textures.iter().any(|&(known, _)| known == handle) {
                 continue;
             }
@@ -607,6 +665,63 @@ struct MotionOp {
     start: usize,
     end: usize,
     bounds: DamageRect,
+}
+
+/// One validated paint command with its conservative logical bounds.
+#[derive(Clone, Copy)]
+pub struct PaintCommand<'a> {
+    pub words: &'a [u32],
+    pub bounds: DamageRect,
+}
+
+/// Borrowed commands prepared by a damage tracker. Queries preserve painter order.
+#[derive(Clone, Copy)]
+pub struct PreparedDrawList<'a> {
+    words: &'a [u32],
+    ops: &'a [MotionOp],
+    rows: &'a [u32],
+    height: u32,
+}
+
+impl<'a> PreparedDrawList<'a> {
+    /// Whether clearing is needed before replaying this region.
+    pub fn requires_clear(self, region: DamageRect) -> bool {
+        !self.commands_in(region).next().is_some_and(|command| {
+            command.words[0] == spec::draw_op::RECT && command.words[3] >> 24 == 255
+                && command.bounds.intersect(region) == region
+        })
+    }
+
+    pub fn commands_in(self, region: DamageRect) -> impl Iterator<Item = PaintCommand<'a>> {
+        let stride = self.ops.len().div_ceil(32);
+        let height = self.height as usize;
+        let first = (region.y0.max(0) as usize * 32 / height.max(1)).min(31);
+        let last = (region.y1.saturating_sub(1).max(0) as usize * 32 / height.max(1)).min(31);
+        (0..stride)
+            .flat_map(move |word| {
+                let mut mask = 0;
+                if !region.is_empty() {
+                    for row in first..=last {
+                        mask |= self.rows[row * stride + word];
+                    }
+                }
+                core::iter::from_fn(move || {
+                    if mask == 0 {
+                        return None;
+                    }
+                    let bit = mask.trailing_zeros() as usize;
+                    mask &= mask - 1;
+                    Some(word * 32 + bit)
+                })
+            })
+            .filter_map(move |index| {
+                let op = &self.ops[index];
+                (!op.bounds.intersect(region).is_empty()).then_some(PaintCommand {
+                    words: &self.words[op.start..op.end],
+                    bounds: op.bounds,
+                })
+            })
+    }
 }
 
 /// How an operation of the current list relates to the previous one.
@@ -945,7 +1060,22 @@ fn motion_damage<const MAX_REGIONS: usize>(
     new: &[MotionOp],
     screen: DamageRect,
     scratch: &mut MotionScratch,
+    allow_motion: bool,
 ) -> DamagePlan<MAX_REGIONS> {
+    if !allow_motion && old.len() == new.len() && old.iter().zip(new).all(|(a, b)| a.code == b.code)
+    {
+        let mut damage = DamagePlan::empty(screen);
+        for (a, b) in old.iter().zip(new) {
+            if painted(b)
+                && (a.bounds != b.bounds
+                    || !same_words(&previous[a.start..a.end], &current[b.start..b.end]))
+            {
+                damage.add(a.bounds, screen);
+                damage.add(b.bounds, screen);
+            }
+        }
+        return damage;
+    }
     let MotionScratch { pairs, covers, obstacles } = scratch;
     align_into(previous, old, current, new, pairs);
     let mut damage = DamagePlan::empty(screen);
@@ -965,7 +1095,7 @@ fn motion_damage<const MAX_REGIONS: usize>(
         }
         if let Some(n) = pair.new_op().filter(|&n| painted(&new[n])) {
             damage.add(new[n].bounds, screen);
-            if let Relation::Moved(dx, dy) = pair.relation {
+            if let (true, Relation::Moved(dx, dy)) = (allow_motion, pair.relation) {
                 let area = new[n].bounds.area();
                 match offsets.iter_mut().find(|(d, _)| *d == (dx, dy)) {
                     Some((_, total)) => *total += area,
@@ -973,6 +1103,9 @@ fn motion_damage<const MAX_REGIONS: usize>(
                 }
             }
         }
+    }
+    if !allow_motion {
+        return damage;
     }
     offsets.sort_by_key(|&(_, area)| core::cmp::Reverse(area));
     // Only damaged pixels need to move; the rest already hold their value.

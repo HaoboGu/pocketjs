@@ -715,6 +715,110 @@ fn clear_black_rect<T: RenderTarget>(target: &mut T, stride: i32, rect: Clip) {
     }
 }
 
+/// RGB565 destination with geometry validated once for mixed software/hardware renderers.
+pub struct Rgb565Canvas<'a> {
+    pixels: &'a mut [u16],
+    width: i32,
+    scale: i32,
+    screen: DamageRect,
+}
+impl<'a> Rgb565Canvas<'a> {
+    pub fn new(ui: &(impl RenderResources + ?Sized), pixels: &'a mut [u16], scale: u32) -> Self {
+        let (width, height) = validate_framebuffer(ui, pixels.len(), scale);
+        Self {
+            pixels,
+            width,
+            scale: scale as i32,
+            screen: DamageRect::new(0, 0, width / scale as i32, height / scale as i32),
+        }
+    }
+    pub fn pixels_mut(&mut self) -> &mut [u16] {
+        self.pixels
+    }
+    pub fn clear(&mut self, region: DamageRect) {
+        let rect = region.intersect(self.screen);
+        if rect.is_empty() {
+            return;
+        }
+        clear_black_rect(
+            &mut Rgb565Target {
+                pixels: self.pixels,
+            },
+            self.width,
+            Clip {
+                x0: rect.x0 * self.scale,
+                y0: rect.y0 * self.scale,
+                x1: rect.x1 * self.scale,
+                y1: rect.y1 * self.scale,
+            },
+        );
+    }
+    pub fn paint(
+        &mut self,
+        ui: &(impl RenderResources + ?Sized),
+        command: pocket_render::damage::PaintCommand<'_>,
+        region: DamageRect,
+    ) {
+        let rect = command.bounds.intersect(region).intersect(self.screen);
+        if rect.is_empty() {
+            return;
+        }
+        paint_command(
+            ui,
+            &mut Rgb565Target {
+                pixels: self.pixels,
+            },
+            self.width,
+            self.scale,
+            Clip {
+                x0: rect.x0 * self.scale,
+                y0: rect.y0 * self.scale,
+                x1: rect.x1 * self.scale,
+                y1: rect.y1 * self.scale,
+            },
+            command.words,
+        );
+    }
+}
+
+/// Repaint regions using commands and bounds already decoded by the damage tracker.
+/// The render resources must remain unchanged since command preparation.
+pub fn render_prepared_rgb565_regions(
+    ui: &(impl RenderResources + ?Sized),
+    commands: pocket_render::damage::PreparedDrawList<'_>,
+    fb: &mut [u16],
+    scale: u32,
+    regions: &[DamageRect],
+) {
+    let mut target = Rgb565Target { pixels: fb };
+    let (width, height, _) = target_geometry(ui, &target, scale);
+    let scale = scale as i32;
+    let screen = DamageRect::new(0, 0, width / scale, height / scale);
+    for &region in regions {
+        let region = region.intersect(screen);
+        if region.is_empty() {
+            continue;
+        }
+        let physical = Clip {
+            x0: region.x0 * scale,
+            y0: region.y0 * scale,
+            x1: region.x1 * scale,
+            y1: region.y1 * scale,
+        };
+        if commands.requires_clear(region) { clear_black_rect(&mut target, width, physical); }
+        for command in commands.commands_in(region) {
+            let bounds = command.bounds.intersect(region);
+            let clip = Clip {
+                x0: bounds.x0 * scale,
+                y0: bounds.y0 * scale,
+                x1: bounds.x1 * scale,
+                y1: bounds.y1 * scale,
+            };
+            paint_command(ui, &mut target, width, scale, clip, command.words);
+        }
+    }
+}
+
 fn render_scaled_clipped<T: RenderTarget>(
     ui: &(impl RenderResources + ?Sized),
     words: &[u32],
@@ -723,144 +827,76 @@ fn render_scaled_clipped<T: RenderTarget>(
     scale: i32,
     screen: Clip,
 ) {
-    let mut stack: [Clip; 32] = [screen; 32];
-    let mut depth: usize = 0;
+    let mut stack = [screen; 32];
+    let mut depth = 0;
     let mut clip = screen;
-
-    let mut i = 0usize;
+    let mut i = 0;
     while i < words.len() {
-        match words[i] {
-            draw_op::RECT => {
-                if i + 4 > words.len() {
-                    return;
-                }
-                let (x, y) = xy(words[i + 1], scale);
-                let (w, h) = wh(words[i + 2], scale);
-                let c = clip.intersect(Clip {
-                    x0: x,
-                    y0: y,
-                    x1: x + w,
-                    y1: y + h,
-                });
-                if c.x0 < c.x1 && c.y0 < c.y1 {
-                    fill_rect(target, width, c, words[i + 3]);
-                }
-                i += 4;
-            }
-            draw_op::GRAD_RECT => {
-                if i + 6 > words.len() {
-                    return;
-                }
-                let (x, y) = xy(words[i + 1], scale);
-                let (w, h) = wh(words[i + 2], scale);
-                grad_rect(
-                    target,
-                    width,
-                    clip,
-                    x,
-                    y,
-                    w,
-                    h,
-                    words[i + 3],
-                    words[i + 4],
-                    words[i + 5],
-                );
-                i += 6;
-            }
-            draw_op::GLYPH_RUN => {
-                if i + 3 > words.len() {
-                    return;
-                }
-                let slot = (words[i + 1] & 0xff) as u8;
-                let n = (words[i + 1] >> 16) as usize;
-                let color = words[i + 2];
-                if i + 3 + 2 * n > words.len() {
-                    return;
-                }
-                glyph_run(
-                    ui,
-                    target,
-                    width,
-                    scale,
-                    clip,
-                    slot,
-                    color,
-                    &words[i + 3..i + 3 + 2 * n],
-                );
-                i += 3 + 2 * n;
-            }
-            draw_op::TEX_QUAD => {
-                if i + 9 > words.len() {
-                    return;
-                }
-                tex_quad(ui, target, width, scale, clip, &words[i + 1..i + 9]);
-                i += 9;
-            }
-            // Native compositor instruction: software surfaces have no
-            // application compositor and leave the shell fallback visible.
-            draw_op::SURFACE_QUAD => {
-                if i + 9 > words.len() {
-                    return;
-                }
-                i += 9;
-            }
+        let Ok(len) = pocket_render::word_len(words, i) else { return; };
+        let command = &words[i..i + len];
+        match command[0] {
             draw_op::SCISSOR => {
-                if i + 3 > words.len() || depth >= stack.len() {
-                    return;
-                }
+                if depth >= stack.len() { return; }
                 stack[depth] = clip;
                 depth += 1;
-                let (x, y) = xy(words[i + 1], scale);
-                let (w, h) = wh(words[i + 2], scale);
-                // The core emits scissor rects already intersected with every
-                // enclosing scissor — SET (still guard against the screen).
-                clip = screen.intersect(Clip {
-                    x0: x,
-                    y0: y,
-                    x1: x + w,
-                    y1: y + h,
-                });
-                i += 3;
+                let (x, y) = xy(command[1], scale);
+                let (w, h) = wh(command[2], scale);
+                clip = screen.intersect(Clip { x0: x, y0: y, x1: x + w, y1: y + h });
             }
             draw_op::SCISSOR_POP => {
-                if depth > 0 {
-                    depth -= 1;
-                    clip = stack[depth];
-                } else {
-                    clip = screen;
-                }
-                i += 1;
+                if depth > 0 { depth -= 1; clip = stack[depth]; }
+                else { clip = screen; }
             }
-            draw_op::TRI => {
-                if i + 7 > words.len() {
-                    return;
-                }
-                tri(target, width, scale, clip, &words[i + 1..i + 7]);
-                i += 7;
-            }
-            draw_op::TEX_TRI => {
-                if i + 12 > words.len() {
-                    return;
-                }
-                tex_tri(ui, target, width, scale, clip, &words[i + 1..i + 12]);
-                i += 12;
-            }
-            draw_op::TEXT_RUN => {
-                // Native-text op (host text system shapes the run); the
-                // software rasterizer has no shaper, so hosts that raster run
-                // with baked measurement and never receive it. Skipped, not a
-                // stop: the op is a known member of the closed set. Variable
-                // length: 8 header words + the packed UTF-8 payload.
-                if i + 8 > words.len() {
-                    return;
-                }
-                let payload = (words[i + 7] as usize).div_ceil(4);
-                i += 8 + payload;
-            }
-            // The op set is closed per DrawList version; anything else means
-            // corrupt data — stop instead of misinterpreting the stream.
-            _ => return,
+            _ => paint_command(ui, target, width, scale, clip, command),
         }
+        i += len;
+    }
+}
+
+fn paint_command<T: RenderTarget>(
+    ui: &(impl RenderResources + ?Sized),
+    target: &mut T,
+    width: i32,
+    scale: i32,
+    clip: Clip,
+    words: &[u32],
+) {
+    match words[0] {
+        draw_op::RECT => {
+            let (x, y) = xy(words[1], scale);
+            let (w, h) = wh(words[2], scale);
+            let c = clip.intersect(Clip {
+                x0: x,
+                y0: y,
+                x1: x + w,
+                y1: y + h,
+            });
+            if c.x0 < c.x1 && c.y0 < c.y1 {
+                fill_rect(target, width, c, words[3]);
+            }
+        }
+        draw_op::GRAD_RECT => {
+            let (x, y) = xy(words[1], scale);
+            let (w, h) = wh(words[2], scale);
+            grad_rect(
+                target, width, clip, x, y, w, h, words[3], words[4], words[5],
+            );
+        }
+        draw_op::GLYPH_RUN => glyph_run(
+            ui,
+            target,
+            width,
+            scale,
+            clip,
+            (words[1] & 0xff) as u8,
+            words[2],
+            &words[3..],
+        ),
+        draw_op::TEX_QUAD => tex_quad(ui, target, width, scale, clip, &words[1..9]),
+        draw_op::TRI => tri(target, width, scale, clip, &words[1..7]),
+        draw_op::TEX_TRI => tex_tri(ui, target, width, scale, clip, &words[1..12]),
+        // Native text and compositor surfaces have no software paint operation.
+        _ => {}
     }
 }
 

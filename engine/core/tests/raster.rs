@@ -720,3 +720,98 @@ fn textures_and_font_coverage_are_sampled_at_physical_resolution() {
         }
     }
 }
+
+#[test]
+fn prepared_damage_preserves_clips_textures_and_painter_order() {
+    let mut ui = Ui::new_with_raster_density(2);
+    ui.set_viewport(64.0, 64.0);
+    assert!(ui.load_font_atlas(&density_two_font()));
+    let texture = ui.upload_texture(&[220, 80, 40, 127].repeat(16), 4, 4, spec::psm::PSM_8888);
+    for scale in 1..=4 {
+        let target = pocket_render::damage::DamageTarget::new(64 * scale, 64 * scale, scale, 1);
+        let mut tracker = DamageTracker::<8>::new();
+        let mut pixels = vec![0; (64 * 64 * scale * scale) as usize];
+        for frame in 0..48 {
+            let mut words = vec![draw_op::RECT, xy_word(0, 0), wh_word(64, 64), 0xffdd_ccbb];
+            if frame % 13 != 0 {
+                words.extend_from_slice(&[draw_op::SCISSOR, xy_word(2, 3), wh_word(59, 57)]);
+                for index in 0..40 {
+                    if (index + frame) % 9 == 0 {
+                        continue;
+                    }
+                    let x = ((index * 17 + frame) % 83) as i16 - 8;
+                    let y = ((index * 11 + frame * 3) % 79) as i16 - 7;
+                    let w = (index % 11 + 3) as u16;
+                    let h = (index % 9 + 2) as u16;
+                    match index % 4 {
+                        0 => words.extend_from_slice(&[
+                            draw_op::RECT,
+                            xy_word(x, y),
+                            wh_word(w, h),
+                            0x80a0_40e0,
+                        ]),
+                        1 => words.extend_from_slice(&[
+                            draw_op::GRAD_RECT,
+                            xy_word(x, y),
+                            wh_word(w, h),
+                            0x40ff_0011,
+                            0xc022_ffff,
+                            spec::GradDir::ToBottom as u32,
+                        ]),
+                        2 => words.extend_from_slice(&[
+                            draw_op::TEX_QUAD,
+                            texture as u32,
+                            xy_word(x, y),
+                            wh_word(w, h),
+                            0,
+                            0,
+                            1.0f32.to_bits(),
+                            1.0f32.to_bits(),
+                            0xb0ff_ffff,
+                        ]),
+                        _ => words.extend_from_slice(&[
+                            draw_op::GLYPH_RUN,
+                            1 << 16,
+                            0xa0ff_ffff,
+                            xy_word(x, y),
+                            0,
+                        ]),
+                    }
+                }
+                words.push(draw_op::SCISSOR_POP);
+            }
+            let plan = tracker.prepare_cached(&ui, &words, target).unwrap();
+            if let Some(commands) = tracker.prepared_commands() {
+                render_prepared_rgb565_regions(&ui, commands, &mut pixels, scale, plan.regions());
+            }
+            tracker.commit(&ui, &words, target);
+            let mut reference = vec![0; pixels.len()];
+            render_scaled_rgb565(&ui, &words, &mut reference, scale);
+            assert!(pixels == reference, "scale {scale}, frame {frame}");
+        }
+    }
+}
+
+#[test]
+fn prepared_clear_is_skipped_only_for_a_covering_opaque_first_command() {
+    let mut ui = Ui::new();
+    ui.set_viewport(12.0, 10.0);
+    let target = pocket_render::damage::DamageTarget::new(12, 10, 1, 0);
+    let screen = pocket_render::damage::DamageRect::new(0, 0, 12, 10);
+    for (words, clear) in [
+        (vec![draw_op::RECT, xy_word(0, 0), wh_word(12, 10), 0xff12_3456], false),
+        (vec![draw_op::RECT, xy_word(0, 0), wh_word(12, 10), 0x8012_3456], true),
+        (vec![draw_op::RECT, xy_word(2, 2), wh_word(8, 6), 0xff12_3456], true),
+        (vec![], true),
+    ] {
+        let mut tracker = DamageTracker::<8>::new();
+        tracker.prepare_cached(&ui, &words, target).unwrap();
+        let commands = tracker.prepared_commands().unwrap();
+        assert_eq!(commands.requires_clear(screen), clear);
+        let mut actual = vec![0xffff; 120];
+        let mut expected = vec![0; 120];
+        render_prepared_rgb565_regions(&ui, commands, &mut actual, 1, &[screen]);
+        render_scaled_rgb565(&ui, &words, &mut expected, 1);
+        assert_eq!(actual, expected);
+    }
+}

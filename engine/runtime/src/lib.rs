@@ -284,7 +284,7 @@ impl OpContext {
             return Ok(OpResult::Integer(handle as i64));
         }
         if generated_ops::supports_core_op(op) {
-            return generated_ops::dispatch(&mut state.ui, op, args);
+            return generated_ops::dispatch_validated(&mut state.ui, op, args);
         }
         let CoreState { ui, providers, .. } = &mut *state;
         providers
